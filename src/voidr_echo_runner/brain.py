@@ -1,16 +1,20 @@
 """Persona brains.
 
-v0 ships `ScriptedBrain`: a deterministic, seeded rule engine that renders
-utterances from the persona's goalTemplate + vocabulary + the agent's last
-utterance. `LLMBrain` is the structured stub for the LLM-driven persona
-(phase 2), gated behind OPENAI_API_KEY / GEMINI_API_KEY.
+`ScriptedBrain`: deterministic, seeded rule engine (default for tests) that
+renders utterances from the persona's goalTemplate + vocabulary + the agent's
+last utterance.
+
+`LLMBrain`: LLM-driven persona via the hive's synchronous gateway
+(`POST {HIVE_URL}/echo/persona-turn`). Per ARCHITECTURE.md section 8.5, ALL
+LLM consumption is centralized in the hive — this runner holds no LLM keys;
+model routing (DeepSeek v4 Pro -> Sonnet escalation) and billing live there.
 """
 
 from __future__ import annotations
 
 import os
 import random
-from typing import Protocol
+from typing import Any, Protocol
 
 from .models import Persona
 from .textutil import keyword_matches
@@ -83,28 +87,146 @@ class ScriptedBrain:
         return utterance
 
 
-class LLMBrain:
-    """Stub for the LLM-driven persona brain (not implemented in v0).
+class HiveError(RuntimeError):
+    """A persona-turn call to the hive failed (payload, PII guard or gateway)."""
 
-    Planned wiring: pipecat LLM service (OpenAILLMService / GoogleLLMService)
-    prompted with temperament + goalTemplate + vocabulary + journey state,
-    low temperature; variation comes from the persona seed, not sampling.
+
+GENERIC_JOURNEY_STATE: dict[str, Any] = {
+    "flowSlug": "conversa-livre",
+    "currentState": "conversa",
+    "expects": [],
+}
+
+
+class LLMBrain:
+    """Persona brain backed by the hive LLM gateway (no LLM keys here).
+
+    Each turn POSTs the persona profile + journey state + conversation history
+    to `{HIVE_URL}/echo/persona-turn` and returns the in-character reply.
+    Mutate `journey_state` between turns to keep the persona contextualized
+    (the chat mode does this with the keyword state classifier).
     """
 
-    def __init__(self, persona: Persona, goal: str, seed: int):
-        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("GEMINI_API_KEY")
-        if not api_key:
+    REQUIRED_ENV = ("HIVE_URL", "HIVE_GATEWAY_TOKEN", "VOIDR_ORG_ID")
+    TIMEOUT_S = 20.0
+
+    def __init__(
+        self,
+        persona: Persona,
+        goal: str,
+        seed: int | None = None,
+        *,
+        escalate: bool = False,
+        client: Any | None = None,
+    ):
+        import httpx
+
+        missing = [name for name in self.REQUIRED_ENV if not os.environ.get(name)]
+        if missing:
             raise RuntimeError(
-                "LLMBrain requires OPENAI_API_KEY or GEMINI_API_KEY. "
+                f"LLMBrain requires env vars: {', '.join(missing)} "
+                "(the hive is the LLM gateway — see .env.example). "
                 "Use the default ScriptedBrain for offline runs (--brain scripted)."
             )
-        raise NotImplementedError(
-            "LLMBrain is a phase-2 feature; the interface is stable (PersonaBrain), "
-            "only the implementation is pending."
+        self.persona = persona
+        self.goal = goal
+        self.seed = seed
+        self.escalate_default = escalate
+        self.base_url = os.environ["HIVE_URL"].rstrip("/")
+        self.org_id = os.environ["VOIDR_ORG_ID"]
+        self._client = client or httpx.Client(
+            timeout=self.TIMEOUT_S,
+            headers={"Authorization": f"Bearer {os.environ['HIVE_GATEWAY_TOKEN']}"},
         )
+        self.history: list[dict[str, str]] = []
+        self.journey_state: dict[str, Any] = dict(GENERIC_JOURNEY_STATE)
+        self.total_cost_usd = 0.0
+        self.last_model: str | None = None
+        self.last_usage: dict[str, Any] | None = None
 
-    def reply(self, agent_utterance: str) -> str:  # pragma: no cover
-        raise NotImplementedError
+    def _persona_payload(self) -> dict[str, Any]:
+        goal_template = self.persona.goalTemplate
+        if self.goal and "{goal}" in goal_template:
+            goal_template = goal_template.format(goal=self.goal)
+        return {
+            "id": self.persona.id,
+            "demographics": {
+                "ageBand": self.persona.demographics.ageBand,
+                "region": self.persona.demographics.region,
+            },
+            "temperament": {
+                "mood": self.persona.temperament.mood,
+                "patienceLevel": self.persona.temperament.patienceLevel,
+                "techSavviness": self.persona.temperament.techSavviness,
+                "verbosity": self.persona.temperament.verbosity,
+                "intentNoise": self.persona.temperament.intentNoise,
+            },
+            "speech": {"disfluencyRate": self.persona.speech.disfluencyRate},
+            "goalTemplate": goal_template,
+            "vocabulary": list(self.persona.vocabulary),
+        }
+
+    def take_turn(self, agent_utterance: str, *, escalate: bool | None = None) -> dict[str, Any]:
+        """One persona turn; returns the full hive response (text/model/usage)."""
+        import httpx
+
+        self.history.append({"role": "agent", "text": agent_utterance})
+        options: dict[str, Any] = {}
+        effective_escalate = self.escalate_default if escalate is None else escalate
+        if effective_escalate:
+            options["escalate"] = True
+        if self.seed is not None:
+            options["seed"] = self.seed
+        payload = {
+            "organizationId": self.org_id,
+            "persona": self._persona_payload(),
+            "journeyState": self.journey_state,
+            "history": self.history,
+            **({"options": options} if options else {}),
+        }
+        url = f"{self.base_url}/echo/persona-turn"
+
+        response = None
+        last_exc: Exception | None = None
+        for attempt in (1, 2):  # short timeout + 1 retry (transport/5xx)
+            try:
+                response = self._client.post(url, json=payload)
+            except httpx.TransportError as exc:
+                last_exc = exc
+                continue
+            if response.status_code < 500 or attempt == 2:
+                break
+        if response is None:
+            raise HiveError(
+                f"hive unreachable at {url}: {type(last_exc).__name__}: {last_exc}"
+            ) from last_exc
+        if response.status_code != 200:
+            detail = ""
+            try:
+                detail = response.json().get("error", "")
+            except Exception:  # noqa: BLE001 — non-JSON error body
+                detail = response.text[:200]
+            hint = {
+                400: "payload inválido para o contrato persona-turn",
+                401: "HIVE_GATEWAY_TOKEN inválido",
+                422: "PII em claro detectado — redija transcripts (<CPF>, <TELEFONE>)",
+                502: "gateway LLM do hive indisponível (LiteLLM/chave não configurados?)",
+            }.get(response.status_code, "")
+            raise HiveError(
+                f"persona-turn falhou ({response.status_code}"
+                + (f" — {hint}" if hint else "")
+                + (f"): {detail}" if detail else ")")
+            )
+
+        data = response.json()
+        self.history.append({"role": "persona", "text": data["text"]})
+        self.last_model = data.get("model")
+        self.last_usage = data.get("usage") or {}
+        self.total_cost_usd += float(self.last_usage.get("costUsd") or 0.0)
+        return data
+
+    def reply(self, agent_utterance: str) -> str:
+        return self.take_turn(agent_utterance)["text"]
 
 
 def build_brain(kind: str, persona: Persona, goal: str, seed: int) -> PersonaBrain:
