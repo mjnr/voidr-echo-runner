@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from .textutil import resolve_placeholders_deep
 
@@ -59,11 +59,22 @@ class VoiceTestCase(BaseModel):
 
     model_config = {"populate_by_name": True}
 
+    # {{env.*}} values substituted at load time — feeds the PII deny-list
+    # (redaction.build_session_for_case). Never serialized.
+    _resolved_secrets: dict[str, str] = PrivateAttr(default_factory=dict)
+
+    @property
+    def resolved_secrets(self) -> dict[str, str]:
+        return self._resolved_secrets
+
     @classmethod
     def load(cls, path: Path) -> "VoiceTestCase":
         data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        data = resolve_placeholders_deep(data)
-        return cls.model_validate(data)
+        captured: dict[str, str] = {}
+        data = resolve_placeholders_deep(data, captured)
+        case = cls.model_validate(data)
+        case._resolved_secrets = captured
+        return case
 
 
 class Demographics(BaseModel):
