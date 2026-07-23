@@ -38,6 +38,11 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--personas", type=Path, default=REPO_ROOT / "personas" / "catalog.yaml")
     run.add_argument("--out", type=Path, default=Path("out"))
     run.add_argument("--run-id", default=None)
+    run.add_argument(
+        "--no-redaction",
+        action="store_true",
+        help="DEV ONLY: skip PII redaction of artifacts (never use with real massas)",
+    )
 
     chat = sub.add_parser(
         "chat",
@@ -90,6 +95,12 @@ def _run(args: argparse.Namespace) -> int:
         flow = load_journey_flow(flow_path)
 
         brain = build_brain(args.brain, persona, case.goal, seed)
+        if args.brain == "llm":
+            # The history sent to the hive must carry massa as placeholders
+            # (the gateway 422s on clear PII) — share the case deny-list.
+            from .redaction import build_session_for_case
+
+            brain.redaction = build_session_for_case(case)
         is_pstn = args.target.startswith(("tel:", "+"))
         if is_pstn and args.mode != "audio":
             raise RuntimeError("tel: targets are audio-only — run with --mode audio")
@@ -154,12 +165,39 @@ def _run(args: argparse.Namespace) -> int:
             "sttTurns": transport.stt_turns,
             "ttsTurns": transport.tts_turns,
             "wavDurationMs": recorder.duration_ms,
-            "wavFile": "call.wav",
         }
+
+    wav_path = None
+    if args.no_redaction:
+        print(
+            "⚠ --no-redaction: artifacts ficam com PII/massa EM CLARO — uso "
+            "exclusivo de dev, nunca com massas reais",
+            file=sys.stderr,
+        )
+        if args.mode == "audio" and recorder is not None:
+            meta["audio"]["wavFile"] = "call.wav"
+            wav_path = args.out / run_id / "call.wav"
+            recorder.save(wav_path)
+    else:
+        from .redaction import build_session_for_case, redact_call_result
+
+        session = build_session_for_case(case)
+        if args.mode == "audio" and recorder is not None:
+            from .audio_redaction import redact_call_audio
+
+            meta["audio"].update(
+                redact_call_audio(recorder, transport.utterances, session, args.out / run_id)
+            )
+            meta["audio"]["wavFile"] = "call.redacted.wav"
+            wav_path = args.out / run_id / "call.redacted.wav"
+        redact_call_result(call, session)
+        if evaluation.error_message:
+            evaluation.error_message = session.redact(evaluation.error_message)
+        meta = session.redact_deep(meta)
+        meta["piiRedactionReport"] = session.report()
+
     report_path = write_artifacts(args.out, run_id, case.id, call, evaluation, meta=meta)
-    if args.mode == "audio" and recorder is not None:
-        wav_path = args.out / run_id / "call.wav"
-        recorder.save(wav_path)
+    if wav_path is not None:
         print(f"  áudio: {wav_path} ({recorder.duration_ms} ms, estéreo tester/agente)")
 
     trajectory = " -> ".join(t.state for t in call.trajectory) or "(vazia)"

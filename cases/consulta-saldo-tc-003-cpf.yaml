@@ -1,0 +1,27 @@
+# Variante do tc-001 para o gate de redação de PII: a persona dita um CPF
+# SINTÉTICO (dígitos verificadores válidos por algoritmo — não é um documento
+# real) ao declarar o objetivo. O smoke verifica que o transcript salvo contém
+# [CPF_1] (nunca o número) e que o call.redacted.wav tem beep no intervalo.
+id: consulta-saldo-tc-003-cpf
+channel: voice
+persona:
+  base: dona-marcia-58-mineira
+  variant_seed: 42
+  overrides: {}
+massa:
+  ani: "11900000001"
+  profile: MASSA_ANI_SALDO
+dial_plan:
+  dtmf_steps:
+    - wait_for_prompt_matching: "codigo de acesso"
+      send: "{{env.MOCK_ACCESS_CODE}}"
+    - wait_for_prompt_matching: "digite o numero"
+      send: "11900000001#"
+journey_flow: ../flows/consulta-saldo-v1.json
+module_slug: jornada-consulta-de-saldo
+goal: "queria saber o saldo da linha, meu CPF é 390.533.447-05"
+assert:
+  flow:
+    must_visit: [saudacao, identificacao, diagnostico_saldo, oferta_recarga, envio_deep_link]
+    must_not_visit: [transferencia_humano, jornada_errada]
+    max_turns: 14

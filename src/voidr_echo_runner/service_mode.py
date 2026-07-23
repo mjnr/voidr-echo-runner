@@ -49,6 +49,7 @@ from .models import (
     PersonaRef,
     VoiceTestCase,
 )
+from .redaction import build_session_for_case, redact_call_result
 from .runner import CallResult, CallRunner
 from .transport import build_transport
 
@@ -71,9 +72,12 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def resolve_params_placeholders(value: str, params: dict[str, str]) -> str:
+def resolve_params_placeholders(
+    value: str, params: dict[str, str], captured: dict[str, str] | None = None
+) -> str:
     """Resolve {{env.NAME}} from ENVIRONMENT_PARAMS (never os.environ here —
-    the job env contract is that secrets travel in ENVIRONMENT_PARAMS)."""
+    the job env contract is that secrets travel in ENVIRONMENT_PARAMS).
+    Substituted values are recorded in `captured` for the PII deny-list."""
 
     def _sub(match: re.Match[str]) -> str:
         name = match.group(1)
@@ -82,6 +86,8 @@ def resolve_params_placeholders(value: str, params: dict[str, str]) -> str:
                 f"placeholder {match.group(0)!r} not found in ENVIRONMENT_PARAMS "
                 f"(available keys: {', '.join(sorted(params)) or '(none)'})"
             )
+        if captured is not None:
+            captured[name] = params[name]
         return params[name]
 
     return ENV_PLACEHOLDER.sub(_sub, value)
@@ -252,12 +258,13 @@ def build_case(
         raise ServeExecutionError(
             f"case {target['testCaseSlug']} has no voice.dialPlan.to — cannot resolve the call target"
         )
-    call_target = resolve_params_placeholders(str(dial_plan_doc["to"]), params)
+    captured: dict[str, str] = {}
+    call_target = resolve_params_placeholders(str(dial_plan_doc["to"]), params, captured)
 
     steps = [
         DtmfStep(
             wait_for_prompt_matching=step.get("waitFor"),
-            send=resolve_params_placeholders(str(step["send"]), params),
+            send=resolve_params_placeholders(str(step["send"]), params, captured),
         )
         for step in dial_plan_doc.get("dtmfSteps", [])
     ]
@@ -300,6 +307,7 @@ def build_case(
         goal=goal,
         assertion=CaseAssert(flow=flow_assert),
     )
+    case._resolved_secrets = captured  # feeds the PII redaction deny-list
     return case, call_target
 
 
@@ -559,6 +567,9 @@ def serve_execution(out_dir: Path) -> int:
 
         case, call_target = build_case(target, case_doc, persona.id, flow, params, plan_id)
         seed = voice_config.get("seed") or 0
+        # PII redaction (ARCHITECTURE.md section 10) — ALWAYS on in service
+        # mode; deny-list from the ENVIRONMENT_PARAMS values used by the case.
+        redaction = build_session_for_case(case)
 
         api.put_shard(
             execution_id,
@@ -567,7 +578,7 @@ def serve_execution(out_dir: Path) -> int:
         )
         print(
             f"  case={case.id} persona={persona.id} seed={seed} flow={flow.id} "
-            f"target={call_target}"
+            f"target={redaction.redact(call_target)}"
         )
 
         brain = build_brain("scripted", persona, case.goal, seed)
@@ -583,6 +594,13 @@ def serve_execution(out_dir: Path) -> int:
         )
         verdict = classify_session(flow, case.assertion.flow, call)
 
+        # Everything persisted or POSTed from here on is redacted
+        # (artifacts, session transcript/timeline, deviation details).
+        redact_call_result(call, redaction)
+        if evaluation.error_message:
+            evaluation.error_message = redaction.redact(evaluation.error_message)
+        verdict.deviations = redaction.redact_deep(verdict.deviations)
+
         run_id = f"{execution_id}-shard-{shard_index}"
         report_path = write_artifacts(
             out_dir,
@@ -597,9 +615,10 @@ def serve_execution(out_dir: Path) -> int:
                 **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
                 "runnerVersion": __version__,
                 "mode": "text",
-                "target": call_target,
+                "target": redaction.redact(call_target),
                 "executionId": execution_id,
                 "shard": {"index": shard_index, "total": shard_total},
+                "piiRedactionReport": redaction.report(),
             },
         )
         run_dir = report_path.parent

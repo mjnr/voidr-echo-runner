@@ -53,6 +53,7 @@ start_mock() {
 run_case() {
   local label="$1" case_file="$2" seed="$3" expected="$4" expect_error="${5:-}"
   local run_id="smoke-$label"
+  rm -rf "${OUT_DIR:?}/$run_id"  # run-ids fixos: artifacts de execuções antigas não podem vazar
   log "runner: $label (esperado: $expected)"
   (cd "$RUNNER_DIR" && uv run --no-sync echo-runner run \
     --case "$case_file" --target "$TARGET" --seed "$seed" \
@@ -98,9 +99,39 @@ PY
 log "preparando ambientes (uv sync)"
 (cd "$MOCK_DIR" && uv sync -q) && (cd "$RUNNER_DIR" && uv sync -q) || { echo "uv sync falhou"; exit 2; }
 
+# check_redaction <run-id>: transcript salvo deve ter [CPF_1] e nunca o CPF cru
+check_redaction() {
+  local run_id="$1"
+  local verdict
+  verdict=$("$RUNNER_DIR/.venv/bin/python" - "$OUT_DIR/$run_id" <<'PY'
+import json, sys
+from pathlib import Path
+run_dir = Path(sys.argv[1])
+problems = []
+blob = (run_dir / "transcript.json").read_text() + (run_dir / "timeline.json").read_text()
+if "39053344705" in blob.replace(".", "").replace("-", ""):
+    problems.append("CPF sintético em claro no transcript/timeline")
+if "[CPF_1]" not in blob:
+    problems.append("placeholder [CPF_1] ausente do transcript")
+meta = json.loads((run_dir / "timeline.json").read_text())["meta"]
+if meta.get("piiRedactionReport", {}).get("CPF") != 1:
+    problems.append(f"piiRedactionReport sem CPF: {meta.get('piiRedactionReport')}")
+print("FAIL: " + "; ".join(problems) if problems else "OK")
+PY
+)
+  if [[ "$verdict" == OK ]]; then
+    SUMMARY+=("PASS  redacao-cpf-artifacts")
+  else
+    SUMMARY+=("FAIL  redacao-cpf-artifacts — $verdict")
+    FAILURES=$((FAILURES + 1))
+  fi
+}
+
 start_mock none
 run_case "consulta-saldo-ok" "cases/consulta-saldo-tc-001.yaml" 42 passed
 run_case "bloqueio-financeiro-ok" "cases/bloqueio-financeiro-tc-002.yaml" 7 passed
+run_case "redacao-cpf" "cases/consulta-saldo-tc-003-cpf.yaml" 42 passed
+check_redaction "smoke-redacao-cpf"
 
 start_mock jornada_errada
 run_case "consulta-saldo-desvio" "cases/consulta-saldo-tc-001.yaml" 42 failed "jornada_errada"
@@ -110,8 +141,9 @@ stop_mock
 
 log "resumo do smoke"
 for line in "${SUMMARY[@]}"; do echo "  $line"; done
+TOTAL=${#SUMMARY[@]}
 if [[ $FAILURES -eq 0 ]]; then
-  echo -e "\n\033[32mSMOKE PASS\033[0m (4/4)"
+  echo -e "\n\033[32mSMOKE PASS\033[0m ($TOTAL/$TOTAL)"
   exit 0
 else
   echo -e "\n\033[31mSMOKE FAIL\033[0m ($FAILURES falha(s))"

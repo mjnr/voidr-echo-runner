@@ -140,6 +140,13 @@ class LLMBrain:
         )
         self.history: list[dict[str, str]] = []
         self.journey_state: dict[str, Any] = dict(GENERIC_JOURNEY_STATE)
+        # The hive rejects clear PII in history/goalTemplate (422) — every
+        # outgoing payload is redacted (ARCHITECTURE.md section 10). Callers
+        # with known massa replace this with the case-level session
+        # (redaction.build_session_for_case) so deny-list values are covered.
+        from .redaction import RedactionSession
+
+        self.redaction = RedactionSession()
         self.total_cost_usd = 0.0
         self.last_model: str | None = None
         self.last_usage: dict[str, Any] | None = None
@@ -177,11 +184,16 @@ class LLMBrain:
             options["escalate"] = True
         if self.seed is not None:
             options["seed"] = self.seed
+        persona_payload = self._persona_payload()
+        persona_payload["goalTemplate"] = self.redaction.redact(persona_payload["goalTemplate"])
         payload = {
             "organizationId": self.org_id,
-            "persona": self._persona_payload(),
+            "persona": persona_payload,
             "journeyState": self.journey_state,
-            "history": self.history,
+            "history": [
+                {"role": turn["role"], "text": self.redaction.redact(turn["text"])}
+                for turn in self.history
+            ],
             **({"options": options} if options else {}),
         }
         url = f"{self.base_url}/echo/persona-turn"
