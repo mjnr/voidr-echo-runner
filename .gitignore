@@ -12,3 +12,8 @@ wheels/
 # Test/run artifacts
 .pytest_cache/
 out/
+
+# Secrets
+.env
+.env.*
+!.env.example

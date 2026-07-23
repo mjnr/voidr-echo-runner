@@ -107,22 +107,67 @@ detectado.
 | Modo áudio | falha rápido com mensagem clara | `--mode audio` + `DEEPGRAM_API_KEY` (STT) e `ELEVENLABS_API_KEY` ou `AZURE_SPEECH_KEY` (TTS); montagem do pipeline Pipecat documentada em `audio.py` |
 | Transporte | `LocalWebSocketTransport` (mock) | `TwilioTransport` atrás de `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`/`TWILIO_FROM_NUMBER` — stub estruturado em `transport.py` com o desenho Media Streams + `calls.create(send_digits=...)` + DTMF mid-call |
 
-## Contrato futuro com o voidr-service (fase 2 — NÃO implementado aqui)
+## Modo service: `echo-runner serve-execution`
 
-O runner passará a ser disparado como job (1 chamada = 1 shard), seguindo o
-mesmo contrato HTTP dos runners existentes (`voidr-k6-runner/README.md`):
+Modo de integração com o voidr-service (mesmo contrato HTTP do
+`voidr-k6-runner`): o runner é disparado como job — 1 chamada = 1 shard — e
+faz todo o ciclo sozinho. Implementado em `src/voidr_echo_runner/service_mode.py`.
 
-1. Autenticar com service account (`VOIDR_CLIENT_ID`/`VOIDR_CLIENT_SECRET`).
-2. `GET /v1/executions/:id` → targets (case + persona resolvida + journey flow
-   + secrets do environment em `ENVIRONMENT_PARAMS`).
-3. Executar a chamada (este CLI é o núcleo) → artifacts em
-   `org/{orgId}/executions/{id}/shards/{i}/`.
-4. `PUT/PATCH /v1/executions/:id/shards/:i` com o `report.json` acima
-   (`stats` + `results[]`, `name` = slug do case).
+```bash
+VOIDR_API_URL=http://localhost:3010 \
+EXECUTION_ID=<execId> \
+VOIDR_ORG_ID=<orgId> \
+VOIDR_CLIENT_ID=sa_... VOIDR_CLIENT_SECRET=sk_... \
+SHARDS_CURRENT=1 SHARDS_TOTAL=2 \
+ENVIRONMENT_PARAMS='{"BASE_URL":"...","IBM_TEST_NUMBER":"ws://..."}' \
+uv run echo-runner serve-execution --out out
+```
 
-O que o worker da fase 2 precisa saber: o `report.json` já está no contrato
-(parser novo `voice-report.parser.ts` pode reusar o shape do k6);
-`transcript.json`/`timeline.json` são os artifacts a subir; o case YAML mapeia
-1:1 para o subdocumento `voice` proposto no `TestCaseItem` (`channel`,
-`persona{base,variant_seed}`, `dialPlan`, `journeyFlowId`, `seed`); placeholders
-`{{env.*}}` são resolvidos pelo runner a partir do ambiente do job.
+Fluxo executado:
+
+1. **Auth** — usa `VOIDR_ACCESS_TOKEN` se o dispatch já injetou um token
+   pré-mintado; senão `POST /v1/service-accounts/token` (client credentials).
+2. **Resolução** — `GET /v1/executions/:id` → pega o target do shard
+   (`SHARDS_CURRENT` é 1-based, `targets[shard-1]`), carrega o case no plan
+   (`GET /v1/test-plans/:planId`, subdocumento `voice`), a persona
+   (`GET /v1/echo/personas/:id`) e o journey flow
+   (`GET /v1/echo/journey-flows/:id`). Placeholders `{{env.*}}` no `dialPlan`
+   e no target são resolvidos com `ENVIRONMENT_PARAMS`.
+3. **Chamada** — `PUT /shards/:i` com `RUNNING`, executa contra o alvo
+   (`dialPlan.to`, ex.: `ws://localhost:8765/ws`) com o core deste CLI
+   (persona brain seedada + classificador de trajetória + avaliador
+   `flowAssert`).
+4. **Artifacts** — pede signed URLs em `POST /v1/executions/:id/artifacts/upload-urls`
+   e sobe `report.json` (contrato k6: `stats` + `results[{name,status,durationMs,errorMessage?}]`,
+   `name` = slug do case) em `shards/{i}/reporter/json/test-results.json`,
+   mais `transcript.json` e `timeline.json`.
+5. **Report** — `PUT /v1/executions/:id/shards/:i` com `FINISHED`/`FAILED`;
+   o service parseia o report (`voice-report.parser.ts`) e persiste
+   `testCaseResults` quando o último shard finaliza.
+6. **Sessão** — `POST /v1/echo/sessions` com transcript, trajetória, status
+   (`passed | deviation | escalation | abandoned | env_failure` — mesma
+   precedência do `voice-eval.service.ts`), `deviations[]`, métricas e paths
+   dos artifacts.
+
+### Envs do contrato
+
+| Env | Obrigatória | Descrição |
+|---|---|---|
+| `VOIDR_API_URL` | sim | Base do voidr-service (ex.: `http://localhost:3010`; `/v1` é adicionado) |
+| `EXECUTION_ID` | sim | Execution `provider: VOICE` criada no service |
+| `VOIDR_ORG_ID` | sim | Organization id (Auth0) |
+| `VOIDR_CLIENT_ID` / `VOIDR_CLIENT_SECRET` | sim* | Credenciais da service account |
+| `VOIDR_ACCESS_TOKEN` | não | Token pré-mintado pelo dispatch; dispensa o par client id/secret |
+| `SHARDS_CURRENT` / `SHARDS_TOTAL` | sim | Shard deste job (1-based) / total |
+| `ENVIRONMENT_PARAMS` | sim | JSON com secrets do environment (resolve `{{env.*}}`) |
+| `MOCK_*`, `OPENAI_API_KEY`, … | não | Passam direto para o core (mesmos knobs do modo CLI) |
+
+\* obrigatório se `VOIDR_ACCESS_TOKEN` não vier.
+
+### Dev local (sem GKE)
+
+O voidr-service com `ECHO_LOCAL_RUNNER_SCRIPT=<path>/scripts/serve-execution.sh`
+(e `NODE_ENV != production`) despacha cada shard de execution VOICE spawnando
+esse wrapper localmente com o env acima — logs em `out/serve-logs/`. Em
+produção o dispatch é um job GKE com a imagem `GKE_ECHO_RUNNER_IMAGE`, mesmo
+contrato de env.
