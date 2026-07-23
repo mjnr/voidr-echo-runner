@@ -39,6 +39,18 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--out", type=Path, default=Path("out"))
     run.add_argument("--run-id", default=None)
 
+    chat = sub.add_parser(
+        "chat",
+        help="persona playground: talk to a persona interactively (LLM via hive)",
+    )
+    chat.add_argument("--persona", required=True, help="persona id from the catalog")
+    chat.add_argument("--personas", type=Path, default=REPO_ROOT / "personas" / "catalog.yaml")
+    chat.add_argument("--journey", type=Path, default=None, help="journey flow JSON for state tracking")
+    chat.add_argument("--voice", action="store_true", help="speak replies (ElevenLabs + afplay)")
+    chat.add_argument("--escalate", action="store_true", help="always route to the escalation model")
+    chat.add_argument("--seed", type=int, default=None, help="best-effort LLM seed")
+    chat.add_argument("--goal", default=None, help="persona goal (fills goalTemplate's {goal})")
+
     serve = sub.add_parser(
         "serve-execution",
         help=(
@@ -54,6 +66,10 @@ def main(argv: list[str] | None = None) -> None:
         from .service_mode import serve_execution
 
         sys.exit(serve_execution(args.out))
+    if args.command == "chat":
+        from .chat import run_chat
+
+        sys.exit(run_chat(args))
     sys.exit(_run(args))
 
 
