@@ -99,10 +99,22 @@ class Speech(BaseModel):
     interruptionPolicy: str | None = None
 
 
+class PersonaProfile(BaseModel):
+    occupation: str = ""
+    context: str = ""
+    freeTraits: list[str] = Field(default_factory=list)
+
+
 class Persona(BaseModel):
     id: str
     kind: str = "curated"
     version: int = 1
+    # Identity (optional, section 5.4): when `name` is set the hive persona-turn
+    # prompt locks the identity so the LLM can't invent another one.
+    name: str = ""
+    age: int | None = None
+    gender: str = ""
+    profile: PersonaProfile | None = None
     demographics: Demographics
     temperament: Temperament
     speech: Speech

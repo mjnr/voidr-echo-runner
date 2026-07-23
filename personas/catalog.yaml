@@ -5,6 +5,17 @@ personas:
   - id: dona-marcia-58-mineira
     kind: curated
     version: 1
+    name: "Dona Márcia"
+    age: 58
+    gender: feminino
+    profile:
+      occupation: aposentada
+      context: >-
+        Mora em Belo Horizonte, cliente pré-pago da Vivo há muitos anos.
+        Liga da sala de casa, com a TV ligada ao fundo.
+      freeTraits:
+        - chama o atendente de "moço"
+        - desconfiada com tecnologia, pede para repetirem
     demographics:
       ageBand: "41-60"
       region: mineiro
@@ -28,6 +39,17 @@ personas:
   - id: carlos-34-paulista
     kind: curated
     version: 1
+    name: Carlos
+    age: 34
+    gender: masculino
+    profile:
+      occupation: analista de logística
+      context: >-
+        Paulistano, liga da rua a caminho do trabalho. Quer resolver
+        rápido e sem enrolação.
+      freeTraits:
+        - direto ao ponto
+        - impaciente com scripts longos
     demographics:
       ageBand: "26-40"
       region: paulista

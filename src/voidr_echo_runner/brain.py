@@ -155,8 +155,33 @@ class LLMBrain:
         goal_template = self.persona.goalTemplate
         if self.goal and "{goal}" in goal_template:
             goal_template = goal_template.format(goal=self.goal)
+        # Identity fields are optional in the contract, but when `name` is set
+        # the hive locks the persona identity in the prompt (no more LLM
+        # inventing "sou o João" for a persona called Cida).
+        identity: dict[str, Any] = {}
+        if self.persona.name:
+            identity["name"] = self.persona.name
+        if self.persona.age is not None:
+            identity["age"] = self.persona.age
+        if self.persona.gender:
+            identity["gender"] = self.persona.gender
+        if self.persona.profile is not None:
+            profile = {
+                key: value
+                for key, value in (
+                    ("occupation", self.persona.profile.occupation),
+                    ("context", self.persona.profile.context),
+                    # the hive contract takes freeTraits as one string; the
+                    # catalog keeps a YAML list for readability
+                    ("freeTraits", "; ".join(self.persona.profile.freeTraits)),
+                )
+                if value
+            }
+            if profile:
+                identity["profile"] = profile
         return {
             "id": self.persona.id,
+            **identity,
             "demographics": {
                 "ageBand": self.persona.demographics.ageBand,
                 "region": self.persona.demographics.region,

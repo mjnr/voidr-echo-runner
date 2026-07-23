@@ -93,6 +93,16 @@ def test_turn_payload_matches_contract(hive_env, persona):
 
     p = body["persona"]
     assert p["id"] == "dona-marcia-58-mineira"
+    # Identity travels with the payload so the hive locks it in the prompt
+    # (no LLM-invented names in phone calls or in the playground).
+    assert p["name"] == "Dona Márcia"
+    assert p["age"] == 58
+    assert p["gender"] == "feminino"
+    assert p["profile"]["occupation"] == "aposentada"
+    assert "Belo Horizonte" in p["profile"]["context"]
+    # freeTraits is a single string in the hive contract (catalog list joined)
+    assert isinstance(p["profile"]["freeTraits"], str)
+    assert 'chama o atendente de "moço"' in p["profile"]["freeTraits"]
     assert p["demographics"] == {"ageBand": "41-60", "region": "mineiro"}
     assert p["temperament"]["mood"] == "ansioso"
     assert p["temperament"]["patienceLevel"] == 2
@@ -101,6 +111,42 @@ def test_turn_payload_matches_contract(hive_env, persona):
     assert "{goal}" not in p["goalTemplate"]
     assert "ver meu saldo" in p["goalTemplate"]
     assert p["vocabulary"] == ["uai", "trem", "ocê"]
+
+
+def test_payload_includes_carlos_identity(hive_env):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    carlos = load_persona_catalog(REPO_ROOT / "personas" / "catalog.yaml")[
+        "carlos-34-paulista"
+    ]
+    LLMBrain(carlos, goal="bloquear a linha", client=_client(handler)).reply("oi")
+
+    p = captured["body"]["persona"]
+    assert p["name"] == "Carlos"
+    assert p["age"] == 34
+    assert p["gender"] == "masculino"
+    assert p["profile"]["occupation"] == "analista de logística"
+
+
+def test_payload_omits_identity_when_persona_has_none(hive_env, persona):
+    """Identity fields are optional in the persona-turn contract: a persona
+    without them must not send name/age/gender/profile keys at all."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    anonymous = persona.model_copy(update={"name": "", "age": None, "gender": "", "profile": None})
+    LLMBrain(anonymous, goal="g", client=_client(handler)).reply("oi")
+
+    p = captured["body"]["persona"]
+    for key in ("name", "age", "gender", "profile"):
+        assert key not in p
 
 
 def test_history_accumulates_and_cost_sums(hive_env, persona):

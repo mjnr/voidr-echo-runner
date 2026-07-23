@@ -80,9 +80,18 @@ class VoicePlayer:
 
 def _print_header(persona: Persona, journey_slug: str | None, voice_on: bool) -> None:
     d, t = persona.demographics, persona.temperament
+    identity = " · ".join(
+        part
+        for part in (
+            persona.name,
+            f"{persona.age} anos" if persona.age is not None else f"{d.ageBand} anos",
+            persona.gender,
+        )
+        if part
+    )
     lines = [
         f"{BOLD}{persona.id}{RESET}  {DIM}v{persona.version} · {persona.kind}{RESET}",
-        f"{d.ageBand} anos · {d.region} · humor {t.mood} · paciência {t.patienceLevel}/5 "
+        f"{identity} · {d.region} · humor {t.mood} · paciência {t.patienceLevel}/5 "
         f"· tech {t.techSavviness} · {t.verbosity}",
         f"jornada: {journey_slug or 'conversa livre'} · voz: "
         + (f"{GREEN}on{RESET} ({persona.speech.voiceId})" if voice_on else f"{DIM}off{RESET}"),
