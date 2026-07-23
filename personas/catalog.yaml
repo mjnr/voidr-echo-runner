@@ -16,7 +16,8 @@ personas:
       intentNoise: nenhum
     speech:
       ttsProvider: elevenlabs
-      voiceId: "placeholder-voice-mineira-01"
+      # ElevenLabs premade "Matilda" (feminina, meia-idade) via eleven_flash_v2_5 pt
+      voiceId: "XrExE9yKIg1WjnnlVkGX"
       speakingRate: 0.95
       backgroundNoise: tv_sala
       disfluencyRate: 0.3
@@ -37,8 +38,9 @@ personas:
       verbosity: monossilabico
       intentNoise: nenhum
     speech:
-      ttsProvider: azure
-      voiceId: "placeholder-voice-paulista-01"
+      ttsProvider: elevenlabs
+      # ElevenLabs premade "Liam" (masculino, jovem) via eleven_flash_v2_5 pt
+      voiceId: "TX3LPaxmHKxFdv7VOQHJ"
       speakingRate: 1.15
       backgroundNoise: rua
       disfluencyRate: 0.1

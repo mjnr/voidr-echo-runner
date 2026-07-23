@@ -45,11 +45,13 @@ class CallRunner:
         flow: JourneyFlow,
         brain: PersonaBrain,
         transport: CallTransport,
+        receive_timeout: float = RECEIVE_TIMEOUT_S,
     ):
         self.case = case
         self.flow = flow
         self.brain = brain
         self.transport = transport
+        self.receive_timeout = receive_timeout
         self.classifier = KeywordStateClassifier(flow)
         self.result = CallResult()
         self._pending_dtmf = list(case.dial_plan.dtmf_steps)
@@ -61,7 +63,9 @@ class CallRunner:
     def _record_event(self, event_type: str, **data: Any) -> None:
         self.result.timeline.append({"ts": self._now_ms(), "type": event_type, **data})
 
-    def _record_transcript(self, speaker: str, text: str, state: str | None = None) -> None:
+    def _record_transcript(
+        self, speaker: str, text: str, state: str | None = None, source: str | None = None
+    ) -> None:
         entry: dict[str, Any] = {
             "index": len(self.result.transcript),
             "speaker": speaker,
@@ -70,6 +74,8 @@ class CallRunner:
         }
         if state is not None:
             entry["state"] = state
+        if source is not None:
+            entry["source"] = source
         self.result.transcript.append(entry)
 
     async def run(self) -> CallResult:
@@ -91,10 +97,10 @@ class CallRunner:
         hard_cap = self.case.assertion.flow.max_turns + HARD_CAP_EXTRA_TURNS
         while True:
             try:
-                msg = await self.transport.receive(timeout=RECEIVE_TIMEOUT_S)
+                msg = await self.transport.receive(timeout=self.receive_timeout)
             except (TimeoutError, asyncio.TimeoutError):
                 self.result.transport_error = (
-                    f"timeout de {RECEIVE_TIMEOUT_S:.0f}s aguardando resposta do agente"
+                    f"timeout de {self.receive_timeout:.0f}s aguardando resposta do agente"
                 )
                 self._record_event("error", message=self.result.transport_error)
                 await self.transport.hangup()
@@ -127,7 +133,7 @@ class CallRunner:
                 await self._handle_ura(text)
                 continue
 
-            await self._handle_agent(text)
+            await self._handle_agent(text, source=msg.get("source", "protocol"))
             if self.result.agent_turns >= hard_cap:
                 self._record_event("hard_cap_reached", agent_turns=self.result.agent_turns)
                 await self.transport.hangup()
@@ -157,7 +163,7 @@ class CallRunner:
         await self.transport.send_dtmf(step.send)
         self._record_event("dtmf_sent", digits=step.send)
 
-    async def _handle_agent(self, text: str) -> None:
+    async def _handle_agent(self, text: str, source: str = "protocol") -> None:
         """Record + classify an agent turn, then reply.
 
         Terminal turns are still replied to: the far side ends the call with a
@@ -166,7 +172,7 @@ class CallRunner:
         self._turn += 1
         self.result.agent_turns += 1
         state = self.classifier.classify(text)
-        self._record_transcript("agent", text, state=state)
+        self._record_transcript("agent", text, state=state, source=source)
         self._record_event("agent_turn", turn=self._turn, state=state)
 
         if state is not None and (

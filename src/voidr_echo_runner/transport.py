@@ -1,14 +1,14 @@
 """Pluggable call transports.
 
-v0: `LocalWebSocketTransport` speaks the vivo-autopilot-mock JSON protocol.
-`TwilioTransport` is a structured stub gated behind TWILIO_* env vars; it will
-carry the real PSTN path (Media Streams + calls.create with sendDigits).
+`LocalWebSocketTransport` speaks the vivo-autopilot-mock JSON protocol (text
+and audio modes). `tel:` targets route to `TwilioMediaStreamTransport`
+(twilio_transport.py): real PSTN calls via Twilio Media Streams, audio-only,
+used behind `AudioTransportAdapter` (--mode audio).
 """
 
 from __future__ import annotations
 
 import json
-import os
 from typing import Any, Protocol
 
 import websockets
@@ -53,6 +53,22 @@ class LocalWebSocketTransport:
     async def send_dtmf(self, digits: str) -> None:
         await self._send({"type": "dtmf", "digits": digits})
 
+    async def send_event(self, name: str, **fields: Any) -> None:
+        await self._send({"type": "event", "name": name, **fields})
+
+    async def send_audio(self, pcm: bytes, sample_rate: int = 16000) -> None:
+        import base64
+
+        await self._send(
+            {
+                "type": "audio",
+                "encoding": "pcm_s16le",
+                "sample_rate": sample_rate,
+                "channels": 1,
+                "data": base64.b64encode(pcm).decode("ascii"),
+            }
+        )
+
     async def hangup(self) -> None:
         await self._send({"type": "event", "name": "hangup"})
         await self.close()
@@ -74,44 +90,15 @@ class LocalWebSocketTransport:
             self._ws = None
 
 
-class TwilioTransport:
-    """PSTN transport stub (phase with real Twilio credentials).
-
-    TODO(echo/twilio): implement using the pattern validated in
-    ARCHITECTURE.md section 3.2:
-      1. twilio.rest.Client(...).calls.create(
-             to=dial_plan.to, from_=TWILIO_FROM_NUMBER,
-             send_digits="ww<code>ww<ani>#", record=True,
-             twiml=<Connect><Stream url=wss://runner/media>)
-      2. Serve the Media Streams WebSocket and bridge 8kHz mu-law frames into
-         the Pipecat pipeline via pipecat's TwilioFrameSerializer (DTMF frames
-         included).
-      3. Prefer mid-call DTMF via POST /Calls/{sid}/Play.json with SendDigits
-         when the IVR prompts in separate steps.
-    """
-
-    REQUIRED_ENV = ("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_FROM_NUMBER")
-
-    def __init__(self, to_number: str):
-        missing = [name for name in self.REQUIRED_ENV if not os.environ.get(name)]
-        if missing:
-            raise RuntimeError(
-                "TwilioTransport requires credentials that are not set: "
-                + ", ".join(missing)
-                + ". Use --target ws://... (LocalWebSocketTransport) for offline runs."
-            )
-        raise NotImplementedError(
-            "TwilioTransport is a structured stub: credentials detected, but the "
-            "Media Streams bridge is not implemented yet (see TODO in transport.py)."
-        )
-
-
-def build_transport(target: str) -> CallTransport:
+def build_transport(target: str, send_digits: str | None = None) -> CallTransport:
     if target.startswith(("ws://", "wss://")):
         return LocalWebSocketTransport(target)
     if target.startswith("tel:") or target.startswith("+"):
-        return TwilioTransport(target)  # type: ignore[return-value]
+        from .twilio_transport import TwilioMediaStreamTransport
+
+        number = target.removeprefix("tel:")
+        return TwilioMediaStreamTransport(number, send_digits=send_digits)
     raise ValueError(
         f"unsupported target {target!r}: use ws://host:port/ws (local mock) "
-        "or tel:+<E164> (Twilio stub)"
+        "or tel:+<E164> (Twilio, requires --mode audio)"
     )
