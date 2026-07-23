@@ -9,8 +9,9 @@ contrato de report, outra mídia.
 O modo texto roda **100% offline** contra o
 [`vivo-autopilot-mock`](../vivo-autopilot-mock). O modo áudio usa STT/TTS reais
 (Deepgram + ElevenLabs via Pipecat) e o transporte Twilio faz chamadas PSTN de
-verdade. Nenhum dado real: ANIs fake, segredos só via env (`.env` gitignored,
-ver `.env.example`).
+verdade. O playground de personas (`echo-runner chat`) conversa com a persona
+via LLM — sempre através do hive, nunca com chave de LLM local. Nenhum dado
+real: ANIs fake, segredos só via env (`.env` gitignored, ver `.env.example`).
 
 ## Como rodar
 
@@ -183,11 +184,50 @@ atravessando `TwilioFrameSerializer` → segmenter → pipeline, DTMF mid-call c
 reconexão do stream em 2.9 s e áudio fluindo após, hangup limpo via REST.
 **Nunca aponte para números Vivo/IBM fora das janelas contratuais.**
 
+## Playground de personas: `echo-runner chat`
+
+"Dar play e conversar com a persona": você digita como o agente da Vivo e a
+persona responde no personagem, com LLM real. Seguindo a regra 8.5 do
+`ARCHITECTURE.md`, **o runner não tem chave de LLM** — o `LLMBrain` chama o
+gateway síncrono do hive (`POST {HIVE_URL}/echo/persona-turn`, auth
+`Bearer HIVE_GATEWAY_TOKEN`), que roteia DeepSeek v4 Pro → Sonnet (escalação)
+e registra billing por organização.
+
+```bash
+# envs no .env: HIVE_URL, HIVE_GATEWAY_TOKEN, VOIDR_ORG_ID
+uv run echo-runner chat --persona dona-marcia-58-mineira \
+  [--journey flows/consulta-saldo-v1.json] [--voice] [--escalate] \
+  [--seed 42] [--goal "quero saber meu saldo"]
+```
+
+- **`--journey`** — mantém o `journeyState` atualizado com o classificador de
+  estados por keywords sobre o que você digita (a persona fica contextualizada
+  na jornada; o estado corrente aparece no rodapé de cada turno). Sem a flag,
+  usa o estado genérico `conversa-livre`.
+- **`--voice`** — além do texto, sintetiza a resposta com a voz ElevenLabs da
+  persona (`speech.voiceId` do catálogo) e toca no alto-falante (afplay).
+  Sem `ELEVENLABS_API_KEY`, degrada para texto com aviso.
+- **`--escalate`** — todos os turnos no modelo de escalação (Sonnet).
+- **`--goal`** — preenche o `{goal}` do `goalTemplate` da persona.
+- **Comandos no prompt**: `/escalate` (força Sonnet no próximo turno),
+  `/state` (mostra o journeyState), `/help`, `/quit` (ou Ctrl-D).
+
+Cada turno mostra o modelo usado e o custo (do `usage` do hive); o custo
+acumulado da conversa é impresso na saída. Erros do hive viram mensagens
+claras: `400` payload, `422` PII em claro no history (redija `<CPF>`,
+`<TELEFONE>`), `502` gateway LLM indisponível.
+
+O mesmo cérebro funciona no modo de teste: `echo-runner run ... --brain llm`
+executa o case com a persona LLM em vez do `ScriptedBrain`.
+
+Para desenvolvimento local, suba o hive da worktree com Mongo/Redis locais e
+aponte `HIVE_URL` para ele (ex.: `http://localhost:3210`).
+
 ## O que é stub / plugável
 
 | Camada | v0 | Como ativa |
 |---|---|---|
-| Cérebro da persona | `ScriptedBrain` (determinístico, seedado) | `LLMBrain` atrás de `OPENAI_API_KEY`/`GEMINI_API_KEY` — stub em `brain.py`, interface `PersonaBrain` estável |
+| Cérebro da persona | `ScriptedBrain` (determinístico, seedado — default dos testes) | `LLMBrain` **implementado** via hive (`--brain llm` / `echo-runner chat`) — envs `HIVE_URL`, `HIVE_GATEWAY_TOKEN`, `VOIDR_ORG_ID`; sem chave de LLM no runner |
 | Modo áudio | **implementado** (Deepgram + ElevenLabs via Pipecat) | `--mode audio` + `DEEPGRAM_API_KEY` + `ELEVENLABS_API_KEY`; TTS Azure (`AZURE_SPEECH_KEY`) segue stub |
 | Transporte | `LocalWebSocketTransport` (mock, texto e áudio) | `TwilioMediaStreamTransport` **implementado** — `tel:+E164` + envs `TWILIO_*` + tunnel público (seção acima) |
 
@@ -244,7 +284,7 @@ Fluxo executado:
 | `VOIDR_ACCESS_TOKEN` | não | Token pré-mintado pelo dispatch; dispensa o par client id/secret |
 | `SHARDS_CURRENT` / `SHARDS_TOTAL` | sim | Shard deste job (1-based) / total |
 | `ENVIRONMENT_PARAMS` | sim | JSON com secrets do environment (resolve `{{env.*}}`) |
-| `MOCK_*`, `OPENAI_API_KEY`, … | não | Passam direto para o core (mesmos knobs do modo CLI) |
+| `MOCK_*`, `HIVE_*`, … | não | Passam direto para o core (mesmos knobs do modo CLI) |
 
 \* obrigatório se `VOIDR_ACCESS_TOKEN` não vier.
 
