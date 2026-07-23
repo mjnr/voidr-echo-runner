@@ -243,6 +243,7 @@ def build_case(
     persona_slug: str,
     flow: JourneyFlow,
     params: dict[str, str],
+    plan_id: str | None = None,
 ) -> tuple[VoiceTestCase, str]:
     """Builds the runner-side VoiceTestCase + the resolved call target URL."""
     voice = case_doc.get("voice") or {}
@@ -292,6 +293,10 @@ def build_case(
         persona=PersonaRef(base=persona_slug, variant_seed=voice.get("seed") or 0),
         dial_plan=DialPlan(to=call_target, dtmf_steps=steps),
         journey_flow="(service)",
+        # Canonical Journey ref: the execution target is authoritative here
+        # (same {testPlanId, moduleSlug} the service resolved the case from).
+        module_slug=target.get("moduleSlug"),
+        test_plan_id=plan_id,
         goal=goal,
         assertion=CaseAssert(flow=flow_assert),
     )
@@ -432,6 +437,7 @@ def build_session_payload(
     call: CallResult,
     verdict: SessionVerdict,
     transcript_path: str | None,
+    module_slug: str | None = None,
 ) -> dict:
     start = call.started_at_ms
 
@@ -467,6 +473,10 @@ def build_session_payload(
         "metrics": {"turns": call.agent_turns, "durationMs": call.duration_ms},
         "deviations": verdict.deviations,
     }
+    # Canonical Journey (module) slug from the case — when absent the service
+    # derives it from the execution's plan (fallback), so we simply omit it.
+    if module_slug:
+        payload["moduleSlug"] = module_slug
     if voice_config.get("journeyFlowId"):
         payload["journeyFlowId"] = voice_config["journeyFlowId"]
     if voice_config.get("personaId"):
@@ -547,7 +557,7 @@ def serve_execution(out_dir: Path) -> int:
             raise ServeExecutionError(f"case {target['testCaseSlug']} has no voice.personaId")
         persona = persona_from_service(api.get_persona(persona_id))
 
-        case, call_target = build_case(target, case_doc, persona.id, flow, params)
+        case, call_target = build_case(target, case_doc, persona.id, flow, params, plan_id)
         seed = voice_config.get("seed") or 0
 
         api.put_shard(
@@ -583,6 +593,8 @@ def serve_execution(out_dir: Path) -> int:
             meta={
                 "persona": {"id": persona.id, "version": persona.version, "variantSeed": seed},
                 "journeyFlowId": flow.id,
+                **({"moduleSlug": case.module_slug} if case.module_slug else {}),
+                **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
                 "runnerVersion": __version__,
                 "mode": "text",
                 "target": call_target,
@@ -628,6 +640,7 @@ def serve_execution(out_dir: Path) -> int:
                     call,
                     verdict,
                     transcript_key,
+                    module_slug=case.module_slug,
                 )
             )
             print(f"  voice session recorded: {session.get('_id', '?')} status={verdict.status}")

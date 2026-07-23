@@ -140,6 +140,8 @@ def _run(args: argparse.Namespace) -> int:
     meta = {
         "persona": {"id": persona.id, "version": persona.version, "variantSeed": seed},
         "journeyFlowId": flow.id,
+        **({"moduleSlug": case.module_slug} if case.module_slug else {}),
+        **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
         "runnerVersion": __version__,
         "mode": args.mode,
         "target": args.target,

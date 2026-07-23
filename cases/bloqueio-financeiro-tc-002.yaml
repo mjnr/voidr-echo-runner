@@ -16,6 +16,9 @@ dial_plan:
     - wait_for_prompt_matching: "digite o numero"
       send: "11900000002#"
 journey_flow: ../flows/bloqueio-financeiro-v1.json
+# Jornada canônica (ModuleItem do TestPlan) a que este case pertence — vai no
+# report/voice-session como `moduleSlug`. Sem o campo, o service deriva do plano.
+module_slug: jornada-bloqueio-financeiro
 goal: "meu telefone não tá fazendo ligação, não consigo ligar pra ninguém"
 arrange: >
   Linha pós-paga fake com bloqueio financeiro parcial (fatura fictícia em aberto).

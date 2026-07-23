@@ -16,6 +16,9 @@ dial_plan:
     - wait_for_prompt_matching: "digite o numero"
       send: "11900000001#"
 journey_flow: ../flows/consulta-saldo-v1.json
+# Jornada canônica (ModuleItem do TestPlan) a que este case pertence — vai no
+# report/voice-session como `moduleSlug`. Sem o campo, o service deriva do plano.
+module_slug: jornada-consulta-de-saldo
 goal: "queria saber quanto de crédito ainda tenho na minha linha e ver de fazer uma recarga"
 arrange: >
   Linha pré-paga fake ativa com saldo fictício. Persona ansiosa, baixa fluência

@@ -45,6 +45,13 @@ class VoiceTestCase(BaseModel):
     massa: dict = Field(default_factory=dict)
     dial_plan: DialPlan = Field(default_factory=DialPlan)
     journey_flow: str
+    # Canonical Journey ref (ARCHITECTURE.md §8.1): the TestPlan ModuleItem this
+    # case belongs to. Optional — when absent the runner omits `moduleSlug` from
+    # the voice-session report and voidr-service derives it from the plan.
+    module_slug: str | None = None
+    # Plan id only makes sense in service mode (it is environment-specific);
+    # in serve-execution it comes from the execution, not from YAML.
+    test_plan_id: str | None = None
     goal: str
     arrange: str | None = None
     act: str | None = None
