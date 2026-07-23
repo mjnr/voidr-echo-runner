@@ -242,14 +242,29 @@ class StereoCallRecorder:
         self.sample_rate = sample_rate
         self._left = bytearray()
         self._right = bytearray()
+        # (channel, start_sample, n_samples) per utterance — lets the PII
+        # audio redactor map transcript spans back to WAV intervals.
+        self.segments: list[tuple[str, int, int]] = []
 
-    def add(self, channel: str, pcm: bytes) -> None:
+    def add(self, channel: str, pcm: bytes) -> int:
+        """Append one utterance; returns its segment index."""
+        start_sample = len(self._left) // 2
         if channel == "tester":
             self._left.extend(pcm)
             self._right.extend(b"\x00" * len(pcm))
         else:
             self._right.extend(pcm)
             self._left.extend(b"\x00" * len(pcm))
+        self.segments.append((channel, start_sample, len(pcm) // 2))
+        return len(self.segments) - 1
+
+    def segment_pcm(self, index: int) -> bytes:
+        channel, start, n = self.segments[index]
+        buf = self._left if channel == "tester" else self._right
+        return bytes(buf[start * 2 : (start + n) * 2])
+
+    def channel_copies(self) -> tuple[bytearray, bytearray]:
+        return bytearray(self._left), bytearray(self._right)
 
     @property
     def duration_ms(self) -> int:
@@ -278,6 +293,8 @@ class AudioTransportAdapter:
         self.recorder = recorder
         self.stt_turns = 0
         self.tts_turns = 0
+        # (segment_index, speaker, text) — feeds the post-call audio redactor.
+        self.utterances: list[tuple[int, str, str]] = []
 
     @property
     def url(self) -> str:
@@ -289,7 +306,8 @@ class AudioTransportAdapter:
 
     async def send_text(self, text: str) -> None:
         pcm = await self.engine.synthesize(text)
-        self.recorder.add("tester", pcm)
+        segment = self.recorder.add("tester", pcm)
+        self.utterances.append((segment, "tester", text))
         self.tts_turns += 1
         await self.inner.send_audio(pcm, sample_rate=self.engine.sample_rate)
 
@@ -309,8 +327,9 @@ class AudioTransportAdapter:
             if msg.get("type") != "audio":
                 return msg
             pcm = base64.b64decode(msg.get("data", ""))
-            self.recorder.add("agent", pcm)
+            segment = self.recorder.add("agent", pcm)
             text = await self.engine.transcribe(pcm)
+            self.utterances.append((segment, msg.get("speaker", "agent"), text))
             self.stt_turns += 1
             return {
                 "type": "text",
