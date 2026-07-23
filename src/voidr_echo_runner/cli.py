@@ -36,7 +36,21 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--out", type=Path, default=Path("out"))
     run.add_argument("--run-id", default=None)
 
+    serve = sub.add_parser(
+        "serve-execution",
+        help=(
+            "run one voidr-service execution shard (env contract: VOIDR_API_URL, "
+            "EXECUTION_ID, VOIDR_ORG_ID, VOIDR_CLIENT_ID/SECRET or VOIDR_ACCESS_TOKEN, "
+            "SHARDS_CURRENT/TOTAL, ENVIRONMENT_PARAMS)"
+        ),
+    )
+    serve.add_argument("--out", type=Path, default=Path("out"))
+
     args = parser.parse_args(argv)
+    if args.command == "serve-execution":
+        from .service_mode import serve_execution
+
+        sys.exit(serve_execution(args.out))
     sys.exit(_run(args))
 
 

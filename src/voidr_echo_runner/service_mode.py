@@ -1,0 +1,680 @@
+"""Service-integration mode (`echo-runner serve-execution`).
+
+Runs ONE execution shard end-to-end against a voidr-service instance,
+following the same HTTP contract as voidr-k6-runner/voidr-runner:
+
+  1. auth: `VOIDR_ACCESS_TOKEN` (pre-minted by the dispatcher) or
+     POST /v1/service-accounts/token with VOIDR_CLIENT_ID/SECRET.
+  2. GET /v1/executions/:id  → planId + targets (VOICE: 1 call = 1 shard,
+     shard N runs target N-1).
+  3. GET /v1/test-plans/:planId → the case's `voice` subdocument
+     (persona/journey-flow ids, dial plan, goal, flowAssert, seed).
+  4. GET /v1/echo/journey-flows/:id + /v1/echo/personas/:id.
+  5. Executes the call (CallRunner core), resolving `{{env.*}}` placeholders
+     from ENVIRONMENT_PARAMS (injected by the service at dispatch).
+  6. Uploads report/artifacts via POST /v1/file-storage/upload (signed URLs):
+     `org/{orgId}/executions/{id}/shards/{i}/reporter/json/test-results.json`
+     is what voice-report.parser.ts consumes at finalize time.
+  7. PUT /v1/executions/:id/shards/:i  (RUNNING → FINISHED/FAILED with
+     stats + results, `name` = test case slug).
+  8. POST /v1/echo/sessions with transcript/trajectory/metrics/deviations.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from . import __version__
+from .artifacts import write_artifacts
+from .brain import build_brain
+from .evaluator import EvaluationResult, evaluate_trajectory
+from .flows import FlowState, JourneyFlow
+from .models import (
+    CaseAssert,
+    DialPlan,
+    DtmfStep,
+    FlowAssert,
+    Persona,
+    PersonaRef,
+    VoiceTestCase,
+)
+from .runner import CallResult, CallRunner
+from .transport import build_transport
+
+ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.([A-Za-z0-9_]+)\s*\}\}")
+
+# Deviation flags — must stay aligned with DEVIATION_FLAGS in
+# voidr-service/src/modules/echo/services/voice-eval.service.ts.
+FLAG_LOOP = "flag:loop"
+FLAG_ABANDONMENT = "flag:abandono"
+FLAG_MUST_NOT_VISIT = "flag:must_not_visit"
+FLAG_MISSING_MUST_VISIT = "flag:must_visit_missing"
+FLAG_MAX_TURNS = "flag:max_turns_exceeded"
+
+
+class ServeExecutionError(RuntimeError):
+    pass
+
+
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def resolve_params_placeholders(value: str, params: dict[str, str]) -> str:
+    """Resolve {{env.NAME}} from ENVIRONMENT_PARAMS (never os.environ here —
+    the job env contract is that secrets travel in ENVIRONMENT_PARAMS)."""
+
+    def _sub(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if name not in params:
+            raise ServeExecutionError(
+                f"placeholder {match.group(0)!r} not found in ENVIRONMENT_PARAMS "
+                f"(available keys: {', '.join(sorted(params)) or '(none)'})"
+            )
+        return params[name]
+
+    return ENV_PLACEHOLDER.sub(_sub, value)
+
+
+class VoidrApi:
+    """Minimal client for the voidr-service runner contract (httpx, sync)."""
+
+    def __init__(self, base_url: str, token: str):
+        self.base_url = base_url.rstrip("/")
+        self._client = httpx.Client(
+            timeout=30.0,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    @classmethod
+    def authenticate(cls, base_url: str, client_id: str, client_secret: str) -> str:
+        resp = httpx.post(
+            f"{base_url.rstrip('/')}/v1/service-accounts/token",
+            json={
+                "grantType": "client_credentials",
+                "clientId": client_id,
+                "clientSecret": client_secret,
+            },
+            timeout=30.0,
+        )
+        if resp.status_code != 201 and resp.status_code != 200:
+            raise ServeExecutionError(
+                f"token exchange failed: HTTP {resp.status_code}: {resp.text[:300]}"
+            )
+        return resp.json()["access_token"]
+
+    def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> Any:
+        url = f"{self.base_url}/v1{path}"
+        last_error: Exception | None = None
+        for attempt in range(retries):
+            try:
+                resp = self._client.request(method, url, **kwargs)
+                if resp.status_code >= 500:
+                    raise ServeExecutionError(
+                        f"{method} {path} → HTTP {resp.status_code}: {resp.text[:300]}"
+                    )
+                if resp.status_code >= 400:
+                    # 4xx is not retryable — fail loudly with the body.
+                    raise ServeExecutionError(
+                        f"{method} {path} → HTTP {resp.status_code}: {resp.text[:500]}"
+                    ) from None
+                body = resp.json()
+                return body.get("data", body) if isinstance(body, dict) else body
+            except ServeExecutionError as exc:
+                if "HTTP 4" in str(exc):
+                    raise
+                last_error = exc
+            except (httpx.TransportError, json.JSONDecodeError) as exc:
+                last_error = exc
+            time.sleep(1.5 * (attempt + 1))
+        raise ServeExecutionError(f"{method} {path} failed after {retries} attempts: {last_error}")
+
+    def get_execution(self, execution_id: str) -> dict:
+        return self._request("GET", f"/executions/{execution_id}")
+
+    def get_test_plan(self, plan_id: str) -> dict:
+        return self._request("GET", f"/test-plans/{plan_id}")
+
+    def get_journey_flow(self, flow_id: str) -> dict:
+        return self._request("GET", f"/echo/journey-flows/{flow_id}")
+
+    def get_persona(self, persona_id: str) -> dict:
+        return self._request("GET", f"/echo/personas/{persona_id}")
+
+    def put_shard(self, execution_id: str, index: int, payload: dict) -> dict:
+        return self._request("PUT", f"/executions/{execution_id}/shards/{index}", json=payload)
+
+    def post_session(self, payload: dict) -> dict:
+        return self._request("POST", "/echo/sessions", json=payload)
+
+    def upload_file(self, key: str, content: bytes, content_type: str) -> str:
+        presigned = self._request(
+            "POST",
+            "/file-storage/upload",
+            json={"key": key, "contentType": content_type, "expiresIn": 3600},
+        )
+        upload_url = presigned["uploadUrl"]
+        headers = {"Content-Type": content_type, **(presigned.get("headers") or {})}
+        put = httpx.put(upload_url, content=content, headers=headers, timeout=60.0)
+        if put.status_code >= 300:
+            raise ServeExecutionError(
+                f"signed-URL upload of {key} failed: HTTP {put.status_code}: {put.text[:300]}"
+            )
+        return key
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Service-document → runner-model mapping
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def flow_from_service(doc: dict) -> JourneyFlow:
+    """Service journey flow (camelCase: maxTurns/deviationRules) → JourneyFlow."""
+    states: dict[str, FlowState] = {}
+    for name, raw in (doc.get("states") or {}).items():
+        states[name] = FlowState(
+            name=name,
+            expects=list(raw.get("expects", [])),
+            next=list(raw.get("next", [])),
+            terminal=bool(raw.get("terminal", False)),
+            classification=raw.get("classification"),
+            max_turns=raw.get("maxTurns", raw.get("max_turns")),
+            evidence=list(raw.get("evidence", [])),
+            keywords=list(raw.get("keywords", [])),
+        )
+    rules = [
+        {"if": r.get("if"), "then": r.get("then")}
+        for r in (doc.get("deviationRules") or doc.get("deviation_rules") or [])
+    ]
+    return JourneyFlow(
+        id=doc.get("slug") or str(doc.get("_id")),
+        source=doc.get("source"),
+        states=states,
+        deviation_rules=rules,
+    )
+
+
+def persona_from_service(doc: dict) -> Persona:
+    return Persona.model_validate(
+        {
+            "id": doc.get("slug") or str(doc.get("_id")),
+            "kind": doc.get("kind", "curated"),
+            "version": doc.get("version", 1),
+            "demographics": doc["demographics"],
+            "temperament": doc["temperament"],
+            "speech": doc["speech"],
+            "goalTemplate": doc["goalTemplate"],
+            "vocabulary": doc.get("vocabulary", []),
+            "massaProfile": doc.get("massaProfile", ""),
+        }
+    )
+
+
+def find_case(plan: dict, target: dict) -> dict:
+    for module in plan.get("modules", []):
+        if module.get("slug") != target["moduleSlug"]:
+            continue
+        for suite in module.get("suites", []):
+            if suite.get("slug") != target["suiteSlug"]:
+                continue
+            for case in suite.get("cases", []):
+                if case.get("slug") == target["testCaseSlug"]:
+                    return case
+    raise ServeExecutionError(
+        f"test case {target['moduleSlug']}/{target['suiteSlug']}/{target['testCaseSlug']} "
+        "not found in the test plan"
+    )
+
+
+def build_case(
+    target: dict,
+    case_doc: dict,
+    persona_slug: str,
+    flow: JourneyFlow,
+    params: dict[str, str],
+) -> tuple[VoiceTestCase, str]:
+    """Builds the runner-side VoiceTestCase + the resolved call target URL."""
+    voice = case_doc.get("voice") or {}
+    dial_plan_doc = voice.get("dialPlan") or {}
+    if not dial_plan_doc.get("to"):
+        raise ServeExecutionError(
+            f"case {target['testCaseSlug']} has no voice.dialPlan.to — cannot resolve the call target"
+        )
+    call_target = resolve_params_placeholders(str(dial_plan_doc["to"]), params)
+
+    steps = [
+        DtmfStep(
+            wait_for_prompt_matching=step.get("waitFor"),
+            send=resolve_params_placeholders(str(step["send"]), params),
+        )
+        for step in dial_plan_doc.get("dtmfSteps", [])
+    ]
+
+    flow_assert_doc = voice.get("flowAssert")
+    if flow_assert_doc:
+        flow_assert = FlowAssert(
+            must_visit=list(flow_assert_doc.get("mustVisit", [])),
+            must_not_visit=list(flow_assert_doc.get("mustNotVisit", [])),
+            max_turns=flow_assert_doc.get("maxTurns") or 20,
+        )
+    else:
+        # Fallback: graph knowledge only — 'desvio_critico' states are always
+        # forbidden (same rule as voice-eval v0 in the service).
+        flow_assert = FlowAssert(
+            must_visit=[],
+            must_not_visit=[
+                name
+                for name, st in flow.states.items()
+                if st.classification == "desvio_critico"
+            ],
+            max_turns=20,
+        )
+
+    goal = voice.get("goal") or case_doc.get("objective") or ""
+    if not goal:
+        act = case_doc.get("act") or []
+        goal = act[0] if act else f"resolver: {case_doc.get('name', target['testCaseSlug'])}"
+
+    case = VoiceTestCase(
+        id=target["testCaseSlug"],
+        channel=voice.get("channel", "voice"),
+        persona=PersonaRef(base=persona_slug, variant_seed=voice.get("seed") or 0),
+        dial_plan=DialPlan(to=call_target, dtmf_steps=steps),
+        journey_flow="(service)",
+        goal=goal,
+        assertion=CaseAssert(flow=flow_assert),
+    )
+    return case, call_target
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Session classification (mirrors voice-eval v0 precedence in the service)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class SessionVerdict:
+    status: str  # passed | deviation | escalation | abandoned | env_failure
+    deviations: list[dict]
+
+
+def classify_session(
+    flow: JourneyFlow,
+    flow_assert: FlowAssert,
+    call: CallResult,
+) -> SessionVerdict:
+    trajectory = [t.state for t in call.trajectory]
+    visited: list[str] = []
+    for state in trajectory:
+        if state not in visited:
+            visited.append(state)
+    deviations: list[dict] = []
+
+    if call.transport_error and call.agent_turns == 0:
+        return SessionVerdict(
+            status="env_failure",
+            deviations=[
+                {
+                    "rule": "env_failure",
+                    "detail": f"Ambiente indisponível antes da conversa: {call.transport_error}",
+                }
+            ],
+        )
+
+    for state in flow_assert.must_not_visit:
+        if state in visited:
+            entry = next(t for t in call.trajectory if t.state == state)
+            deviations.append(
+                {
+                    "stateId": state,
+                    "rule": FLAG_MUST_NOT_VISIT,
+                    "detail": (
+                        f"Estado proibido '{state}' foi visitado no turno {entry.turn} "
+                        f'(fala do agente: "{entry.utterance[:120]}")'
+                    ),
+                }
+            )
+
+    for state in flow_assert.must_visit:
+        if state not in visited:
+            deviations.append(
+                {
+                    "stateId": state,
+                    "rule": FLAG_MISSING_MUST_VISIT,
+                    "detail": f"Estado obrigatório '{state}' não foi visitado",
+                }
+            )
+
+    if call.agent_turns > flow_assert.max_turns:
+        deviations.append(
+            {
+                "rule": FLAG_MAX_TURNS,
+                "detail": (
+                    f"Conversa excedeu o orçamento de turnos: "
+                    f"{call.agent_turns} > {flow_assert.max_turns}"
+                ),
+            }
+        )
+
+    # Loop: per-state maxTurns tolerates N consecutive repeats; N+1 flags.
+    run_state: str | None = None
+    run_length = 0
+    looped: set[str] = set()
+    for state in trajectory:
+        if state == run_state:
+            run_length += 1
+        else:
+            run_state = state
+            run_length = 1
+        limit = flow.states.get(state).max_turns if state in flow.states else None
+        if limit is not None and run_length > limit and state not in looped:
+            looped.add(state)
+            deviations.append(
+                {
+                    "stateId": state,
+                    "rule": FLAG_LOOP,
+                    "detail": f"Estado '{state}' repetido {run_length}x (máximo {limit} turnos)",
+                }
+            )
+
+    last_state = trajectory[-1] if trajectory else None
+    terminal_state = (
+        last_state
+        if last_state is not None and flow.states.get(last_state, None) and flow.states[last_state].terminal
+        else None
+    )
+    if terminal_state is None:
+        deviations.append(
+            {
+                **({"stateId": last_state} if last_state else {}),
+                "rule": FLAG_ABANDONMENT,
+                "detail": (
+                    f"Conversa encerrou em '{last_state}' sem alcançar um estado terminal"
+                    if last_state
+                    else "Conversa encerrou sem nenhum estado classificado"
+                ),
+            }
+        )
+
+    escalation = (
+        terminal_state is not None
+        and (flow.states[terminal_state].classification or "") in ("escalacao", "escalation")
+    )
+    has_non_abandonment = any(d["rule"] != FLAG_ABANDONMENT for d in deviations)
+
+    if has_non_abandonment:
+        status = "deviation"
+    elif escalation:
+        status = "escalation"
+    elif terminal_state is None:
+        status = "abandoned"
+    else:
+        status = "passed"
+    return SessionVerdict(status=status, deviations=deviations)
+
+
+def build_session_payload(
+    execution_id: str,
+    shard_index: int,
+    case_slug: str,
+    voice_config: dict,
+    call: CallResult,
+    verdict: SessionVerdict,
+    transcript_path: str | None,
+) -> dict:
+    start = call.started_at_ms
+
+    def rel(ts: int) -> int:
+        return max(0, int(ts) - start)
+
+    transcript = [
+        {
+            # Session schema is diarized tester|agent — URA prompts are far-side.
+            "role": "tester" if entry["speaker"] == "tester" else "agent",
+            "text": entry["text"],
+            "tsMs": rel(entry["ts"]),
+        }
+        for entry in call.transcript
+    ]
+    timeline = [
+        {
+            "type": event["type"],
+            "tsMs": rel(event["ts"]),
+            "data": {k: v for k, v in event.items() if k not in ("ts", "type")},
+        }
+        for event in call.timeline
+    ]
+    payload: dict[str, Any] = {
+        "executionId": execution_id,
+        "shardIndex": shard_index,
+        "caseSlug": case_slug,
+        "channel": voice_config.get("channel", "voice"),
+        "status": verdict.status,
+        "trajectory": [t.state for t in call.trajectory],
+        "transcript": transcript,
+        "timeline": timeline,
+        "metrics": {"turns": call.agent_turns, "durationMs": call.duration_ms},
+        "deviations": verdict.deviations,
+    }
+    if voice_config.get("journeyFlowId"):
+        payload["journeyFlowId"] = voice_config["journeyFlowId"]
+    if voice_config.get("personaId"):
+        payload["personaId"] = voice_config["personaId"]
+    if voice_config.get("seed") is not None:
+        payload["seed"] = voice_config["seed"]
+    if transcript_path:
+        payload["artifacts"] = {"transcriptPath": transcript_path}
+    return payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Orchestration
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def serve_execution(out_dir: Path) -> int:
+    api_url = os.environ.get("VOIDR_API_URL")
+    execution_id = os.environ.get("EXECUTION_ID")
+    org_id = os.environ.get("VOIDR_ORG_ID")
+    if not api_url or not execution_id or not org_id:
+        print(
+            "echo-runner serve-execution: VOIDR_API_URL, EXECUTION_ID and VOIDR_ORG_ID are required",
+            file=sys.stderr,
+        )
+        return 2
+
+    shard_index = int(os.environ.get("SHARDS_CURRENT", "1"))
+    shard_total = int(os.environ.get("SHARDS_TOTAL", "1"))
+    params: dict[str, str] = json.loads(os.environ.get("ENVIRONMENT_PARAMS", "{}") or "{}")
+
+    token = os.environ.get("VOIDR_ACCESS_TOKEN")
+    if not token:
+        client_id = os.environ.get("VOIDR_CLIENT_ID")
+        client_secret = os.environ.get("VOIDR_CLIENT_SECRET")
+        if not client_id or not client_secret:
+            print(
+                "echo-runner serve-execution: set VOIDR_ACCESS_TOKEN or "
+                "VOIDR_CLIENT_ID + VOIDR_CLIENT_SECRET",
+                file=sys.stderr,
+            )
+            return 2
+        token = VoidrApi.authenticate(api_url, client_id, client_secret)
+    api = VoidrApi(api_url, token)
+
+    print(
+        f"▶ serve-execution execution={execution_id} shard={shard_index}/{shard_total} "
+        f"org={org_id} api={api_url}"
+    )
+
+    started_at = _iso_now()
+    try:
+        execution = api.get_execution(execution_id)
+        targets = execution.get("targets") or []
+        if shard_index < 1 or shard_index > len(targets):
+            raise ServeExecutionError(
+                f"shard {shard_index} has no target (execution has {len(targets)} targets; "
+                "VOICE contract is 1 call = 1 shard = 1 target)"
+            )
+        target = targets[shard_index - 1]
+        plan_id = str(execution.get("planId"))
+
+        plan = api.get_test_plan(plan_id)
+        case_doc = find_case(plan, target)
+        voice_config = case_doc.get("voice") or {}
+        if not voice_config:
+            raise ServeExecutionError(
+                f"case {target['testCaseSlug']} has no `voice` config — not a VOICE case"
+            )
+
+        journey_flow_id = voice_config.get("journeyFlowId")
+        if not journey_flow_id:
+            raise ServeExecutionError(f"case {target['testCaseSlug']} has no voice.journeyFlowId")
+        flow = flow_from_service(api.get_journey_flow(journey_flow_id))
+
+        persona_id = voice_config.get("personaId")
+        if not persona_id:
+            raise ServeExecutionError(f"case {target['testCaseSlug']} has no voice.personaId")
+        persona = persona_from_service(api.get_persona(persona_id))
+
+        case, call_target = build_case(target, case_doc, persona.id, flow, params)
+        seed = voice_config.get("seed") or 0
+
+        api.put_shard(
+            execution_id,
+            shard_index,
+            {"status": "RUNNING", "startedAt": started_at},
+        )
+        print(
+            f"  case={case.id} persona={persona.id} seed={seed} flow={flow.id} "
+            f"target={call_target}"
+        )
+
+        brain = build_brain("scripted", persona, case.goal, seed)
+        transport = build_transport(call_target)
+        runner = CallRunner(case, flow, brain, transport)
+        call = asyncio.run(runner.run())
+        evaluation = evaluate_trajectory(
+            case.assertion.flow,
+            call.trajectory,
+            call.agent_turns,
+            call.end_reason,
+            transport_error=call.transport_error,
+        )
+        verdict = classify_session(flow, case.assertion.flow, call)
+
+        run_id = f"{execution_id}-shard-{shard_index}"
+        report_path = write_artifacts(
+            out_dir,
+            run_id,
+            case.id,
+            call,
+            evaluation,
+            meta={
+                "persona": {"id": persona.id, "version": persona.version, "variantSeed": seed},
+                "journeyFlowId": flow.id,
+                "runnerVersion": __version__,
+                "mode": "text",
+                "target": call_target,
+                "executionId": execution_id,
+                "shard": {"index": shard_index, "total": shard_total},
+            },
+        )
+        run_dir = report_path.parent
+
+        # Upload artifacts. The reporter JSON path is the one the service's
+        # finalizeReport reads for VOICE shards.
+        shard_prefix = f"org/{org_id}/executions/{execution_id}/shards/{shard_index}"
+        transcript_key: str | None = None
+        try:
+            api.upload_file(
+                f"{shard_prefix}/reporter/json/test-results.json",
+                report_path.read_bytes(),
+                "application/json",
+            )
+            transcript_key = api.upload_file(
+                f"{shard_prefix}/artifacts/transcript.json",
+                (run_dir / "transcript.json").read_bytes(),
+                "application/json",
+            )
+            api.upload_file(
+                f"{shard_prefix}/artifacts/timeline.json",
+                (run_dir / "timeline.json").read_bytes(),
+                "application/json",
+            )
+            print(f"  artifacts uploaded under {shard_prefix}/")
+        except Exception as upload_error:  # noqa: BLE001 — report shard even if upload fails
+            print(f"  artifact upload failed (continuing): {upload_error}", file=sys.stderr)
+
+        # Voice session first (best effort), then the shard PUT that can
+        # trigger execution finalization.
+        try:
+            session = api.post_session(
+                build_session_payload(
+                    execution_id,
+                    shard_index,
+                    case.id,
+                    voice_config,
+                    call,
+                    verdict,
+                    transcript_key,
+                )
+            )
+            print(f"  voice session recorded: {session.get('_id', '?')} status={verdict.status}")
+        except Exception as session_error:  # noqa: BLE001
+            print(f"  voice session POST failed (continuing): {session_error}", file=sys.stderr)
+
+        report = json.loads(report_path.read_text())
+        api.put_shard(
+            execution_id,
+            shard_index,
+            {
+                "status": "FINISHED",
+                "startedAt": started_at,
+                "finishedAt": _iso_now(),
+                "durationMs": call.duration_ms,
+                "stats": report["stats"],
+                "results": [
+                    {
+                        "name": r["name"],
+                        "status": r["status"] if r["status"] in ("passed", "failed", "skipped") else "failed",
+                        "durationMs": r.get("durationMs", 0),
+                        **({"errorMessage": r["errorMessage"]} if r.get("errorMessage") else {}),
+                    }
+                    for r in report["results"]
+                ],
+            },
+        )
+        trajectory = " -> ".join(t.state for t in call.trajectory) or "(vazia)"
+        print(f"  trajetória: {trajectory}")
+        print(f"  resultado: {evaluation.status.upper()}  sessão: {verdict.status}")
+        if evaluation.error_message:
+            print(f"  motivo: {evaluation.error_message}")
+        print(f"  shard {shard_index}/{shard_total} FINISHED reportado")
+        return 0
+    except Exception as exc:  # noqa: BLE001 — report infra failure to the service
+        print(f"echo-runner serve-execution: FAILED: {exc}", file=sys.stderr)
+        try:
+            api.put_shard(
+                execution_id,
+                shard_index,
+                {
+                    "status": "FAILED",
+                    "startedAt": started_at,
+                    "finishedAt": _iso_now(),
+                    "errorMessage": str(exc)[:2000],
+                },
+            )
+        except Exception as report_error:  # noqa: BLE001
+            print(f"failed to report shard FAILED: {report_error}", file=sys.stderr)
+        return 1
