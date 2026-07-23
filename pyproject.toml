@@ -1,0 +1,28 @@
+[project]
+name = "voidr-echo-runner"
+version = "0.1.0"
+description = "voidr echo runner: synthetic voice tester that dials a target conversational agent, executes voice test cases (persona + dial plan + journey flow) and emits Voidr runner reports"
+readme = "README.md"
+authors = [
+    { name = "Milson Ramos", email = "milson.ramos@voidr.co" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "pipecat-ai>=1.6.0",
+    "pipecat-ai-flows>=1.3.0",
+    "pydantic>=2.13.4",
+    "pyyaml>=6.0.3",
+    "websockets>=16.1.1",
+]
+
+[project.scripts]
+echo-runner = "voidr_echo_runner.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
