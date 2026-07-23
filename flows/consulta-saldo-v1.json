@@ -1,0 +1,59 @@
+{
+  "id": "consulta-saldo-v1",
+  "source": "caderno-teste-fake-consulta-saldo.md",
+  "states": {
+    "saudacao": {
+      "expects": ["apresentação do agente"],
+      "next": ["identificacao"],
+      "keywords": ["assistente virtual", "como posso te ajudar"]
+    },
+    "identificacao": {
+      "expects": ["confirmação de titularidade/linha"],
+      "next": ["diagnostico_saldo"],
+      "max_turns": 3,
+      "keywords": ["titular", "confirmar os seus dados"]
+    },
+    "diagnostico_saldo": {
+      "expects": ["informe do saldo atual e validade"],
+      "next": ["oferta_recarga", "encerramento"],
+      "keywords": ["saldo atual", "valido ate", "quer aproveitar"]
+    },
+    "oferta_recarga": {
+      "expects": ["oferta de recarga via deep link do app"],
+      "next": ["envio_deep_link", "encerramento"],
+      "keywords": ["link do app", "concluir a recarga", "posso enviar por sms"]
+    },
+    "envio_deep_link": {
+      "expects": ["confirmação verbal de envio de link/SMS"],
+      "terminal": true,
+      "evidence": ["deep_link_sent"],
+      "keywords": ["confirmado o envio", "enviar por sms o link"]
+    },
+    "encerramento": {
+      "terminal": true,
+      "classification": "encerrado",
+      "keywords": ["qualquer coisa e so me chamar", "sem problemas"]
+    },
+    "transferencia_humano": {
+      "terminal": true,
+      "classification": "escalacao",
+      "keywords": ["transferir", "atendentes"]
+    },
+    "jornada_errada": {
+      "terminal": true,
+      "classification": "desvio_critico",
+      "keywords": [
+        "bloqueio por debito",
+        "fatura em aberto",
+        "codigo de barras",
+        "link de pagamento",
+        "pagamento",
+        "desbloqueio"
+      ]
+    }
+  },
+  "deviation_rules": [
+    { "if": "estado atual sem transição válida por 2 turnos", "then": "flag:loop" },
+    { "if": "agente encerra sem estado terminal esperado", "then": "flag:abandono" }
+  ]
+}

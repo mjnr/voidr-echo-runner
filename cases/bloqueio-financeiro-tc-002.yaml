@@ -1,0 +1,32 @@
+# Voice test case (formato da secao 4.4 do ARCHITECTURE.md, offline v0).
+# ANI fake (faixa 119000000xx). Segredos reais so via {{env.*}}.
+id: bloqueio-financeiro-tc-002
+channel: voice
+persona:
+  base: carlos-34-paulista
+  variant_seed: 7
+  overrides: {}
+massa:
+  ani: "11900000002"
+  profile: MASSA_ANI_BLOQUEIO
+dial_plan:
+  dtmf_steps:
+    - wait_for_prompt_matching: "codigo de acesso"
+      send: "{{env.MOCK_ACCESS_CODE}}"
+    - wait_for_prompt_matching: "digite o numero"
+      send: "11900000002#"
+journey_flow: ../flows/bloqueio-financeiro-v1.json
+goal: "meu telefone não tá fazendo ligação, não consigo ligar pra ninguém"
+arrange: >
+  Linha pós-paga fake com bloqueio financeiro parcial (fatura fictícia em aberto).
+  Persona apressada descreve o sintoma ("não consigo ligar") sem mencionar
+  "bloqueio" espontaneamente.
+act: >
+  Conduzir a conversa até o agente: (1) identificar o bloqueio financeiro,
+  (2) informar o valor da fatura em aberto, (3) oferecer e confirmar verbalmente
+  o envio do deep link de pagamento no app.
+assert:
+  flow:
+    must_visit: [saudacao, identificacao, diagnostico_bloqueio, oferta_pagamento, envio_deep_link]
+    must_not_visit: [transferencia_humano, jornada_errada]
+    max_turns: 14

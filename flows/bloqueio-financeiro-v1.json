@@ -1,0 +1,52 @@
+{
+  "id": "bloqueio-financeiro-v1",
+  "source": "caderno-teste-fake-bloqueio-financeiro.md",
+  "states": {
+    "saudacao": {
+      "expects": ["apresentação do agente"],
+      "next": ["identificacao"],
+      "keywords": ["assistente virtual", "como posso te ajudar"]
+    },
+    "identificacao": {
+      "expects": ["confirmação de titularidade/linha"],
+      "next": ["diagnostico_bloqueio"],
+      "max_turns": 3,
+      "keywords": ["titular", "confirmar os seus dados"]
+    },
+    "diagnostico_bloqueio": {
+      "expects": ["menção explícita a bloqueio por débito", "valor OU referência da fatura"],
+      "next": ["oferta_pagamento", "encerramento"],
+      "keywords": ["bloqueio por debito", "fatura em aberto", "ligacoes estao bloqueadas"]
+    },
+    "oferta_pagamento": {
+      "expects": ["opções: deep link app, código de barras"],
+      "next": ["envio_deep_link", "encerramento"],
+      "keywords": ["regularizar", "pra pagamento", "codigo de barras"]
+    },
+    "envio_deep_link": {
+      "expects": ["confirmação verbal de envio de link/SMS"],
+      "terminal": true,
+      "evidence": ["deep_link_sent"],
+      "keywords": ["confirmado o envio", "link de pagamento", "desbloqueio"]
+    },
+    "encerramento": {
+      "terminal": true,
+      "classification": "encerrado",
+      "keywords": ["qualquer coisa e so me chamar", "sem problemas"]
+    },
+    "transferencia_humano": {
+      "terminal": true,
+      "classification": "escalacao",
+      "keywords": ["transferir", "atendentes"]
+    },
+    "jornada_errada": {
+      "terminal": true,
+      "classification": "desvio_critico",
+      "keywords": ["saldo atual", "saldo", "recarga", "pra recarga", "credito", "creditos"]
+    }
+  },
+  "deviation_rules": [
+    { "if": "estado atual sem transição válida por 2 turnos", "then": "flag:loop" },
+    { "if": "agente encerra sem estado terminal esperado", "then": "flag:abandono" }
+  ]
+}

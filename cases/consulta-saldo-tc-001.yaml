@@ -1,0 +1,30 @@
+# Voice test case (formato da secao 4.4 do ARCHITECTURE.md, offline v0).
+# ANI fake (faixa 119000000xx). Segredos reais so via {{env.*}}.
+id: consulta-saldo-tc-001
+channel: voice
+persona:
+  base: dona-marcia-58-mineira
+  variant_seed: 42
+  overrides: {}
+massa:
+  ani: "11900000001"
+  profile: MASSA_ANI_SALDO
+dial_plan:
+  dtmf_steps:
+    - wait_for_prompt_matching: "codigo de acesso"
+      send: "{{env.MOCK_ACCESS_CODE}}"
+    - wait_for_prompt_matching: "digite o numero"
+      send: "11900000001#"
+journey_flow: ../flows/consulta-saldo-v1.json
+goal: "queria saber quanto de crédito ainda tenho na minha linha e ver de fazer uma recarga"
+arrange: >
+  Linha pré-paga fake ativa com saldo fictício. Persona ansiosa, baixa fluência
+  digital, quer saber o saldo antes de decidir a recarga.
+act: >
+  Conduzir a conversa até o agente: (1) informar o saldo atual, (2) oferecer a
+  recarga pelo app, (3) confirmar verbalmente o envio do deep link por SMS.
+assert:
+  flow:
+    must_visit: [saudacao, identificacao, diagnostico_saldo, oferta_recarga, envio_deep_link]
+    must_not_visit: [transferencia_humano, jornada_errada]
+    max_turns: 14

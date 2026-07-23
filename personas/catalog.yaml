@@ -1,0 +1,47 @@
+# Catalogo de personas v0 (schema da secao 5.4 do ARCHITECTURE.md).
+# voiceId sao placeholders — vozes reais entram na fase de audio.
+# goalTemplate usa {goal}, preenchido pelo campo `goal` do test case.
+personas:
+  - id: dona-marcia-58-mineira
+    kind: curated
+    version: 1
+    demographics:
+      ageBand: "41-60"
+      region: mineiro
+    temperament:
+      mood: ansioso
+      patienceLevel: 2
+      techSavviness: baixa
+      verbosity: normal
+      intentNoise: nenhum
+    speech:
+      ttsProvider: elevenlabs
+      voiceId: "placeholder-voice-mineira-01"
+      speakingRate: 0.95
+      backgroundNoise: tv_sala
+      disfluencyRate: 0.3
+    goalTemplate: "Oi, moço... então, {goal}, sabe? Fiquei até preocupada."
+    vocabulary: [uai, trem, "ocê"]
+    massaProfile: MASSA_ANI_SALDO
+
+  - id: carlos-34-paulista
+    kind: curated
+    version: 1
+    demographics:
+      ageBand: "26-40"
+      region: paulista
+    temperament:
+      mood: apressado
+      patienceLevel: 3
+      techSavviness: alta
+      verbosity: monossilabico
+      intentNoise: nenhum
+    speech:
+      ttsProvider: azure
+      voiceId: "placeholder-voice-paulista-01"
+      speakingRate: 1.15
+      backgroundNoise: rua
+      disfluencyRate: 0.1
+    goalTemplate: "Oi, seguinte: {goal}. Consegue resolver rápido?"
+    vocabulary: [meu, beleza]
+    massaProfile: MASSA_ANI_BLOQUEIO
