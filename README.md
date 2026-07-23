@@ -69,9 +69,10 @@ uv run echo-runner run --case cases/consulta-saldo-tc-001.yaml \
   nova; a arquitetura é `CallRunner` (inalterado) + `AudioTransportAdapter`
   (`audio.py`), que converte áudio→texto e texto→áudio com pipelines Pipecat
   reais por turno.
-- Artifacts extras em `out/<run-id>/`: `call.wav` (estéreo: L = tester,
-  R = agente) e `meta.audio` no `timeline.json` (voiceId, turnos STT/TTS,
-  duração).
+- Artifacts extras em `out/<run-id>/`: `call.redacted.wav` (estéreo: L =
+  tester, R = agente, PII com beep de 1 kHz — ver "Redação de PII"; o cru só
+  com `ECHO_KEEP_RAW_AUDIO=1`) e `meta.audio` no `timeline.json` (voiceId,
+  turnos STT/TTS, duração, beeps).
 
 ### Smoke de áudio (consome créditos Deepgram/ElevenLabs)
 
@@ -79,10 +80,12 @@ uv run echo-runner run --case cases/consulta-saldo-tc-001.yaml \
 ./smoke/run-smoke-audio.sh
 ```
 
-Mesma matriz do smoke texto (2 happy paths PASSED + 2 desvios FAILED citando
-`jornada_errada`), validando também `call.wav` e transcript vindo de STT real.
-Custo típico da matriz completa: ~28k caracteres de TTS (~USD 1–2 no plano
-ElevenLabs) + ~8 min de STT Deepgram (~USD 0.05).
+Mesma matriz do smoke texto (happy paths PASSED + desvios FAILED citando
+`jornada_errada`, mais o case `tc-003` em que a persona dita um CPF sintético),
+validando também `call.redacted.wav` (com beep de 1 kHz no intervalo do CPF),
+a ausência do `call.wav` cru e transcript vindo de STT real.
+Custo típico da matriz completa: ~35k caracteres de TTS (~USD 1–2 no plano
+ElevenLabs) + ~10 min de STT Deepgram (~USD 0.06).
 
 ## Anatomia de um run
 
@@ -96,11 +99,14 @@ ElevenLabs) + ~8 min de STT Deepgram (~USD 0.05).
    ARCHITECTURE.md) e registra a trajetória.
 4. **Avaliação local v0**: `assert.flow` (`must_visit` / `must_not_visit` /
    `max_turns`) → passed/failed.
-5. **Artifacts** em `./out/<run-id>/`:
+5. **Redação de PII** (sempre ativa — seção abaixo): transcript, timeline,
+   report e áudio são redigidos ANTES de qualquer persistência.
+6. **Artifacts** em `./out/<run-id>/`:
    - `transcript.json` — diarizado (`ura`/`agent`/`tester`), timestamps, estado
-     classificado por turno do agente
+     classificado por turno do agente, PII como placeholders (`[CPF_1]`)
    - `timeline.json` — eventos (dtmf, turnos, transições de estado,
-     encerramento) + trajetória + metadados (persona@version+seed, flow id)
+     encerramento) + trajetória + metadados (persona@version+seed, flow id,
+     `piiRedactionReport`)
    - `report.json` — contrato do runner Voidr (idêntico ao voidr-k6-runner):
 
 ```json
@@ -110,6 +116,55 @@ ElevenLabs) + ~8 min de STT Deepgram (~USD 0.05).
                "errorMessage": "só quando failed"}]
 }
 ```
+
+## Redação de PII (seção 10 do ARCHITECTURE.md)
+
+Pré-requisito para chamadas reais com massas da Vivo: **nenhum dado sensível
+em texto plano em nenhum artifact, payload ou log**. A redação é **sempre
+ativa** no `run` e no `serve-execution` (`--no-redaction` existe só para dev,
+com warning) e roda em `redaction.py` + `audio_redaction.py`, em duas camadas:
+
+1. **Deny-list de massas (a camada crítica)** — os valores injetados via
+   `{{env.X}}` no case e os valores de `massa`/`dial_plan` são conhecidos no
+   runtime e redigidos por igualdade E por fuzzy de dígitos: com/sem
+   pontuação, espaçados, ditados dígito a dígito ("nove um nove zero..."),
+   inclusive "meia" = 6. O placeholder é rastreável sem expor o valor:
+   `[MASSA_MOCK_ACCESS_CODE]`, `[MASSA_ANI]`.
+2. **Detectores genéricos BR** — regex + validadores para precisão:
+   - CPF (com máscara, sem máscara e por extenso; dígitos verificadores
+     validados) → `[CPF_n]`
+   - CNPJ (dígitos verificadores) → `[CNPJ_n]`
+   - telefone BR (+55, DDD, celular/fixo, por extenso) → `[TELEFONE_n]`
+   - cartão (Luhn) → `[CARTAO_n]`, CEP → `[CEP_n]`, e-mail → `[EMAIL_n]`
+   - data de nascimento **em contexto** ("nascida em ...") → `[DATA_NASCIMENTO_n]`
+   - fail-closed: qualquer sequência ditada de ≥ 8 dígitos que não casou com
+     nada acima é tratada como potencial ANI → `[NUMERO_n]`
+     (números inválidos NÃO escapam: CPF com DV errado vira `[NUMERO_n]`)
+
+Mesma entidade ⇒ mesmo placeholder na sessão inteira (o transcript continua
+legível). O `timeline.json` (meta) e o serve-execution carregam o
+`piiRedactionReport` — contagem de entidades por tipo, nunca os valores.
+
+**Áudio**: os segmentos do WAV cujo texto contém PII são re-transcritos via
+Deepgram prerecorded (word-level timestamps) e os intervalos das palavras de
+PII recebem **beep de 1 kHz** (±120 ms de padding), gerando
+`call.redacted.wav`. Se o alinhamento por palavras falhar, o turno INTEIRO é
+beepado (fail-closed). O `call.wav` cru é **descartado por default** — só é
+mantido com `ECHO_KEEP_RAW_AUDIO=1`. Custo/latência: pós-chamada (zero impacto
+na conversa ao vivo), 1 chamada REST por segmento com PII.
+
+**Caminhos protegidos**: artifacts (`transcript/timeline/report`), payload do
+`POST /echo/sessions` (transcript, timeline, deviations, target), history
+enviado ao `persona-turn` do hive (que também valida — 422 com PII em claro) e
+os eventos `dtmf_sent` da timeline (código de acesso/ANI digitados).
+
+**Engine**: detector próprio (regex + DV/Luhn + parser de dígitos falados),
+zero dependência extra. [Microsoft Presidio](https://github.com/microsoft/presidio)
+com spaCy `pt_core_news_lg` fica como segunda passada **opt-in** para NER de
+nomes/endereços (custo: ~500 MB de modelo + dependência pesada — instale
+`presidio-analyzer` + `presidio-anonymizer` e rode sobre o transcript já
+redigido; os recognizers custom de CPF/CNPJ daqui continuam necessários, o
+Presidio não os traz nativos).
 
 ## Formatos de entrada
 
