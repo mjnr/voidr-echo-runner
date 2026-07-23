@@ -6,9 +6,11 @@ encarnando uma persona e avalia a trajetória contra um journey flow (máquina d
 estados). Irmão de `voidr-runner` (Playwright) e `voidr-k6-runner` (k6) — mesmo
 contrato de report, outra mídia.
 
-v0 roda **100% offline** em modo texto contra o
-[`vivo-autopilot-mock`](../vivo-autopilot-mock). Nenhum dado real: ANIs fake,
-segredos apenas como placeholders `{{env.*}}`.
+O modo texto roda **100% offline** contra o
+[`vivo-autopilot-mock`](../vivo-autopilot-mock). O modo áudio usa STT/TTS reais
+(Deepgram + ElevenLabs via Pipecat) e o transporte Twilio faz chamadas PSTN de
+verdade. Nenhum dado real: ANIs fake, segredos só via env (`.env` gitignored,
+ver `.env.example`).
 
 ## Como rodar
 
@@ -36,6 +38,50 @@ Sobe o mock limpo → roda os 2 cases (espera PASSED) → reinicia o mock com
 `MOCK_DEVIATION=jornada_errada` → roda de novo (espera FAILED com
 `errorMessage` citando `jornada_errada`) → imprime resumo PASS/FAIL. Totalmente
 offline. Testes unitários: `uv run pytest`.
+
+## Modo áudio (`--mode audio`)
+
+Áudio real nos dois sentidos contra o mock (protocolo WS ganha mensagens
+`audio`, PCM s16le mono 16 kHz base64, uma fala completa por mensagem — ver
+README do mock):
+
+```bash
+# exige DEEPGRAM_API_KEY e ELEVENLABS_API_KEY (no .env dos dois repos)
+uv run echo-runner run --case cases/consulta-saldo-tc-001.yaml \
+  --target ws://localhost:8765/ws --seed 42 --mode audio
+```
+
+- **STT**: `DeepgramSTTService` do Pipecat (websocket streaming, `nova-2`,
+  `language=pt-BR`) — cada fala do agente chega como áudio e o transcript é o
+  que o STT ouviu de verdade (`entries[].source == "stt"`).
+- **TTS**: `ElevenLabsHttpTTSService` do Pipecat (`eleven_flash_v2_5`,
+  `language=pt`, PCM 16 kHz). Vozes por persona (premade da voice library,
+  em `personas/catalog.yaml`):
+
+| Persona | Voz ElevenLabs | voiceId |
+|---|---|---|
+| `dona-marcia-58-mineira` | Matilda (feminina, meia-idade) | `XrExE9yKIg1WjnnlVkGX` |
+| `carlos-34-paulista` | Liam (masculino, jovem) | `TX3LPaxmHKxFdv7VOQHJ` |
+| agente do mock | Sarah (via `MOCK_TTS_VOICE_ID`) | `EXAVITQu4vr4xnSDxMaL` |
+
+- O cérebro continua o `ScriptedBrain` determinístico — o áudio é a camada
+  nova; a arquitetura é `CallRunner` (inalterado) + `AudioTransportAdapter`
+  (`audio.py`), que converte áudio→texto e texto→áudio com pipelines Pipecat
+  reais por turno.
+- Artifacts extras em `out/<run-id>/`: `call.wav` (estéreo: L = tester,
+  R = agente) e `meta.audio` no `timeline.json` (voiceId, turnos STT/TTS,
+  duração).
+
+### Smoke de áudio (consome créditos Deepgram/ElevenLabs)
+
+```bash
+./smoke/run-smoke-audio.sh
+```
+
+Mesma matriz do smoke texto (2 happy paths PASSED + 2 desvios FAILED citando
+`jornada_errada`), validando também `call.wav` e transcript vindo de STT real.
+Custo típico da matriz completa: ~28k caracteres de TTS (~USD 1–2 no plano
+ElevenLabs) + ~8 min de STT Deepgram (~USD 0.05).
 
 ## Anatomia de um run
 
@@ -99,13 +145,51 @@ LLM classifier substitui na fase seguinte, mesma interface). O estado virtual
 `jornada_errada` carrega keywords da jornada *errada* — é assim que o desvio é
 detectado.
 
+## Transporte Twilio (chamadas PSTN reais)
+
+`--target tel:+<E164>` (exige `--mode audio`) usa `TwilioMediaStreamTransport`
+(`twilio_transport.py`):
+
+1. `calls.create` outbound com TwiML inline `<Connect><Stream/>` apontando para
+   o servidor WebSocket local do runner (Media Streams, 8 kHz μ-law via
+   `TwilioFrameSerializer` do Pipecat), `send_digits` com pausas `w` (montado
+   automaticamente do `dial_plan` do case) e **gravação dual-channel** ligada.
+2. Áudio de entrada é segmentado em falas por VAD de energia
+   (`UtteranceSegmenter`) e entra no mesmo `AudioTransportAdapter` do modo
+   áudio local (STT/TTS/brain idênticos).
+3. **DTMF mid-call**: a Twilio *não* suporta DTMF outbound por Media Streams
+   bidirecional, e o endpoint REST `/Calls/{sid}/Play.json` **não existe**
+   (404 code 20404, verificado em chamada real). O caminho implementado é o
+   workaround suportado: update do TwiML com `<Play digits>` +
+   re-`<Connect><Stream>` — o stream cai e reconecta em ~1–3 s (validado ao
+   vivo). Prefira `send_digits` na criação da chamada para navegar a URA.
+
+Envs: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` e
+`TWILIO_STREAM_PUBLIC_URL` (URL pública do tunnel):
+
+```bash
+# terminal 1 — tunnel para a porta do Media Streams server (default 8990)
+cloudflared tunnel --url http://localhost:8990   # ou: ngrok http 8990
+# copie a URL pública para o .env como TWILIO_STREAM_PUBLIC_URL=wss://<host>
+
+# terminal 2 — chamada real (SÓ nas janelas contratuais, com coordenação)
+uv run echo-runner run --case cases/consulta-saldo-tc-001.yaml \
+  --target tel:+55XXXXXXXXXXX --mode audio --seed 42
+```
+
+Validação real executada (números próprios da conta, ~20 s de chamadas):
+Media Stream conectado via cloudflared em ~3 s, 8.2 s de fala inbound
+atravessando `TwilioFrameSerializer` → segmenter → pipeline, DTMF mid-call com
+reconexão do stream em 2.9 s e áudio fluindo após, hangup limpo via REST.
+**Nunca aponte para números Vivo/IBM fora das janelas contratuais.**
+
 ## O que é stub / plugável
 
 | Camada | v0 | Como ativa |
 |---|---|---|
 | Cérebro da persona | `ScriptedBrain` (determinístico, seedado) | `LLMBrain` atrás de `OPENAI_API_KEY`/`GEMINI_API_KEY` — stub em `brain.py`, interface `PersonaBrain` estável |
-| Modo áudio | falha rápido com mensagem clara | `--mode audio` + `DEEPGRAM_API_KEY` (STT) e `ELEVENLABS_API_KEY` ou `AZURE_SPEECH_KEY` (TTS); montagem do pipeline Pipecat documentada em `audio.py` |
-| Transporte | `LocalWebSocketTransport` (mock) | `TwilioTransport` atrás de `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN`/`TWILIO_FROM_NUMBER` — stub estruturado em `transport.py` com o desenho Media Streams + `calls.create(send_digits=...)` + DTMF mid-call |
+| Modo áudio | **implementado** (Deepgram + ElevenLabs via Pipecat) | `--mode audio` + `DEEPGRAM_API_KEY` + `ELEVENLABS_API_KEY`; TTS Azure (`AZURE_SPEECH_KEY`) segue stub |
+| Transporte | `LocalWebSocketTransport` (mock, texto e áudio) | `TwilioMediaStreamTransport` **implementado** — `tel:+E164` + envs `TWILIO_*` + tunnel público (seção acima) |
 
 ## Modo service: `echo-runner serve-execution`
 
