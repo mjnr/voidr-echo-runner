@@ -147,6 +147,14 @@ class LLMBrain:
         from .redaction import RedactionSession
 
         self.redaction = RedactionSession()
+        # Optional deterministic emotional state machine (PERSONAS-SOTA P0.3).
+        # The OWNER of the conversation loop (CallRunner/chat) updates it per
+        # agent turn; this brain only injects the current state in the prompt.
+        # The hive persona-turn contract has no emotionalState field yet, so
+        # the block rides inside goalTemplate (see README contract note).
+        from .emotional import EmotionalStateMachine
+
+        self.emotional: EmotionalStateMachine | None = None
         self.total_cost_usd = 0.0
         self.last_model: str | None = None
         self.last_usage: dict[str, Any] | None = None
@@ -155,6 +163,8 @@ class LLMBrain:
         goal_template = self.persona.goalTemplate
         if self.goal and "{goal}" in goal_template:
             goal_template = goal_template.format(goal=self.goal)
+        if self.emotional is not None:
+            goal_template = f"{goal_template}\n\n{self.emotional.prompt_block()}"
         # Identity fields are optional in the contract, but when `name` is set
         # the hive locks the persona identity in the prompt (no more LLM
         # inventing "sou o João" for a persona called Cida).

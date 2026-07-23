@@ -35,6 +35,7 @@ RESET = "\033[0m" if _TTY else ""
 HELP = """comandos:
   /escalate   força Sonnet no próximo turno
   /state      mostra o estado atual da jornada
+  /emotion    curva emocional da conversa (estado por turno)
   /help       esta ajuda
   /quit       encerra (Ctrl-D também)"""
 
@@ -137,6 +138,11 @@ def run_chat(args) -> int:
         print(f"echo-runner chat: {exc}", file=sys.stderr)
         return 2
 
+    from .emotional import EmotionalStateMachine
+
+    emotional = EmotionalStateMachine.for_persona(persona, seed=args.seed)
+    brain.emotional = emotional
+
     voice = None
     if args.voice:
         voice = VoicePlayer(persona)
@@ -168,13 +174,29 @@ def run_chat(args) -> int:
         if agent_text == "/state":
             print(f"{DIM}journeyState: {brain.journey_state}{RESET}")
             continue
+        if agent_text == "/emotion":
+            if not emotional.history:
+                print(f"{DIM}curva emocional: (ainda sem turnos){RESET}")
+                continue
+            print(f"{DIM}curva emocional ({emotional.badge()}):{RESET}")
+            for rec in emotional.history:
+                events = ", ".join(rec.events) or "sem gatilho (decay)"
+                action = f"  {RED}<< {rec.action}{RESET}" if rec.action else ""
+                print(
+                    f"  {DIM}t{rec.turn:02d}{RESET} {rec.emotion} "
+                    f"{rec.intensity:.2f} {rec.direction} ({rec.delta:+.2f})"
+                    f" {DIM}{events}{RESET}{action}"
+                )
+            continue
         if agent_text == "/escalate":
             force_escalate = True
             print(f"{YELLOW}próximo turno será escalado (Sonnet){RESET}")
             continue
 
+        state_changed = False
         if classifier is not None and flow is not None:
             state = classifier.classify(agent_text)
+            state_changed = state is not None and state != current_state
             if state is not None:
                 current_state = state
             state_def = flow.states.get(current_state)
@@ -185,6 +207,10 @@ def run_chat(args) -> int:
             }
         else:
             brain.journey_state = dict(GENERIC_JOURNEY_STATE)
+
+        # Appraise BEFORE the turn so the persona replies from the new state
+        # (same order as CallRunner).
+        emo_rec = emotional.update(agent_text, state_changed=state_changed)
 
         try:
             result = brain.take_turn(agent_text, escalate=force_escalate or None)
@@ -198,8 +224,15 @@ def run_chat(args) -> int:
         model = result.get("model", "?")
         badge = f"{YELLOW}sonnet{RESET}" if usage.get("escalated") else f"{GREEN}{model}{RESET}"
         state_tag = f" · {brain.journey_state['currentState']}" if flow else ""
+        emo_color = RED if emo_rec.intensity >= 0.6 else (YELLOW if emo_rec.intensity >= 0.3 else GREEN)
+        emo_tag = f" · {emo_color}{emotional.badge()}{RESET}{DIM}"
+        if emo_rec.action:
+            emo_tag += f" {RED}<< {emo_rec.action}{RESET}{DIM}"
         print(f"{BOLD}{persona.id.split('-')[0]}>{RESET} {result['text']}")
-        print(f"  {DIM}[{RESET}{badge}{DIM} · ${usage.get('costUsd', 0):.4f}{state_tag}]{RESET}")
+        print(
+            f"  {DIM}[{RESET}{badge}{DIM} · ${usage.get('costUsd', 0):.4f}"
+            f"{state_tag}{emo_tag}]{RESET}"
+        )
         if voice is not None:
             warning = voice.speak(result["text"])
             if warning:
@@ -207,6 +240,7 @@ def run_chat(args) -> int:
 
     print(
         f"\n{BOLD}fim da conversa{RESET} — {turns} turno(s), "
-        f"custo acumulado {GREEN}${brain.total_cost_usd:.4f}{RESET}"
+        f"custo acumulado {GREEN}${brain.total_cost_usd:.4f}{RESET}, "
+        f"emoção final {emotional.badge()}"
     )
     return 0

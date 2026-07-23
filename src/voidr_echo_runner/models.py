@@ -105,6 +105,35 @@ class PersonaProfile(BaseModel):
     freeTraits: list[str] = Field(default_factory=list)
 
 
+class EmotionalTrigger(BaseModel):
+    """Appraisal rule: event name -> intensity delta (optional emotion switch)."""
+
+    on: str
+    delta: float
+    emotion: str | None = None
+
+
+class EmotionalThresholds(BaseModel):
+    # Defaults are unreachable: personas without explicit thresholds never
+    # escalate to asking for a human / hanging up.
+    pedirHumano: float = 1.1
+    desligar: float = 1.1
+
+
+class EmotionalModel(BaseModel):
+    """PERSONAS-SOTA.md P0.3 — deterministic emotional state machine config.
+
+    Absent from a persona => stable neutral default (flat curve). Trigger
+    deltas/thresholds are authored per persona, already accounting for
+    patience (patient personas escalate slower)."""
+
+    initialEmotion: str = "calmo"
+    initialIntensity: float = 0.2
+    decayPerTurn: float = 0.0
+    triggers: list[EmotionalTrigger] = Field(default_factory=list)
+    thresholds: EmotionalThresholds = Field(default_factory=EmotionalThresholds)
+
+
 class Persona(BaseModel):
     id: str
     kind: str = "curated"
@@ -115,6 +144,7 @@ class Persona(BaseModel):
     age: int | None = None
     gender: str = ""
     profile: PersonaProfile | None = None
+    emotionalModel: EmotionalModel | None = None
     demographics: Demographics
     temperament: Temperament
     speech: Speech

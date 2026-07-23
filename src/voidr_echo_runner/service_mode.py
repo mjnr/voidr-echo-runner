@@ -617,6 +617,9 @@ def serve_execution(out_dir: Path) -> int:
                 "the environment must set voice mode 'audio' (ECHO_CALL_MODE)"
             )
 
+        from .emotional import EmotionalStateMachine
+
+        emotional = EmotionalStateMachine.for_persona(persona, seed=seed)
         brain = build_brain("scripted", persona, case.goal, seed)
         send_digits = None
         if is_pstn and case.dial_plan.dtmf_steps:
@@ -634,7 +637,9 @@ def serve_execution(out_dir: Path) -> int:
             recorder = StereoCallRecorder()
             transport = AudioTransportAdapter(transport, engine, recorder)
             receive_timeout = 45.0  # remote STT+TTS per turn
-        runner = CallRunner(case, flow, brain, transport, receive_timeout=receive_timeout)
+        runner = CallRunner(
+            case, flow, brain, transport, receive_timeout=receive_timeout, emotional=emotional
+        )
 
         async def _run_call():
             try:
@@ -672,6 +677,12 @@ def serve_execution(out_dir: Path) -> int:
             "executionId": execution_id,
             "shard": {"index": shard_index, "total": shard_total},
         }
+        if emotional.history:
+            meta["emotionalCurve"] = emotional.curve()
+            meta["emotionalFinal"] = {
+                "emotion": emotional.emotion,
+                "intensity": emotional.intensity,
+            }
         wav_path: Path | None = None
         if mode == "audio" and recorder is not None:
             meta["audio"] = {

@@ -267,7 +267,8 @@ uv run echo-runner chat --persona dona-marcia-58-mineira \
 - **`--escalate`** — todos os turnos no modelo de escalação (Sonnet).
 - **`--goal`** — preenche o `{goal}` do `goalTemplate` da persona.
 - **Comandos no prompt**: `/escalate` (força Sonnet no próximo turno),
-  `/state` (mostra o journeyState), `/help`, `/quit` (ou Ctrl-D).
+  `/state` (mostra o journeyState), `/emotion` (curva emocional da conversa),
+  `/help`, `/quit` (ou Ctrl-D).
 
 Cada turno mostra o modelo usado e o custo (do `usage` do hive); o custo
 acumulado da conversa é impresso na saída. Erros do hive viram mensagens
@@ -279,6 +280,45 @@ executa o case com a persona LLM em vez do `ScriptedBrain`.
 
 Para desenvolvimento local, suba o hive da worktree com Mongo/Redis locais e
 aponte `HIVE_URL` para ele (ex.: `http://localhost:3210`).
+
+## Máquina de estados emocional (PERSONAS-SOTA.md, P0.3)
+
+Humor que evolui não é adjetivo no prompt — é estado `{emoção, intensidade}`
+mantido pelo **runner** (`emotional.py`), atualizado por regras determinísticas
+de appraisal a cada turno do agente Vivo e injetado no prompt do persona-turn.
+Nenhuma chamada LLM extra por turno; mesma conversa ⇒ mesma curva (o `seed` é
+registrado e reservado para comportamentos estocásticos futuros, P1.2).
+
+- **Gatilhos detectados** (keywords + sinais do runner): `repetiu_pergunta`
+  (similaridade entre perguntas), `pediu_dado_ja_informado` (pediu CPF/telefone/
+  nome/etc. pela 2ª vez — suprime o gatilho genérico de repetição),
+  `nao_entendeu_fala`, `pediu_espera`, `transferiu`, `jargao_tecnico`,
+  `pediu_desculpa` (empatia acalma), `resolveu_etapa` (avanço da jornada, via
+  classificador de estados existente) e `latencia_alta` (>3.5s medidos pelo
+  runner). Sem gatilho, aplica-se o `decayPerTurn` (atendimento fluindo acalma).
+- **Parametrização por persona**: bloco `emotionalModel` no catálogo
+  (baseline, sensibilidade por gatilho, thresholds) — os valores já embutem a
+  paciência (Dona Márcia, patience 2, escala mais rápido e tem thresholds mais
+  baixos que o Carlos). Persona sem o bloco ⇒ default neutro estável (curva
+  plana, thresholds inalcançáveis). Nota YAML: a chave `on` precisa de aspas
+  (`"on":`) — YAML 1.1 interpreta `on` puro como booleano.
+- **Thresholds acionáveis**: ao cruzar `pedirHumano` a persona pede um atendente
+  humano UMA vez; ao cruzar `desligar`, se despede e encerra — o comportamento
+  vai ao prompt e a ação fica registrada na curva.
+- **Timeline**: cada turno gera um evento `emotional_state` no `timeline.json`,
+  e o `meta` da sessão ganha `emotionalCurve` (estado por turno) e
+  `emotionalFinal` — insumo para o painel ("cliente saiu da chamada com
+  frustração 0.9"). Vale para `run` e `serve-execution` (inclusive com
+  `ScriptedBrain`, como telemetria).
+- **Chat**: o rodapé de cada turno mostra `[emoção 0.45 ↗]`; `/emotion` imprime
+  a curva completa com gatilhos e ações.
+
+**Pendência de contrato (hive):** o `POST /echo/persona-turn` ainda não tem
+campo estruturado para o estado emocional (o zod atual descartaria chaves
+desconhecidas silenciosamente), então o runner injeta o bloco
+`[ESTADO EMOCIONAL ...]` dentro do `goalTemplate` — compatível hoje. Quando o
+prompt v2 (P0.2 da spec) aceitar `emotionalState {emotion, intensity, guidance}`
+no contrato, mover a injeção para o campo dedicado.
 
 ## O que é stub / plugável
 

@@ -46,6 +46,7 @@ class CallRunner:
         brain: PersonaBrain,
         transport: CallTransport,
         receive_timeout: float = RECEIVE_TIMEOUT_S,
+        emotional: Any | None = None,
     ):
         self.case = case
         self.flow = flow
@@ -56,6 +57,10 @@ class CallRunner:
         self.result = CallResult()
         self._pending_dtmf = list(case.dial_plan.dtmf_steps)
         self._turn = 0
+        # EmotionalStateMachine (emotional.py): updated per agent turn; the
+        # per-turn state goes to the timeline as the auditable emotional curve.
+        self.emotional = emotional
+        self._last_reply_monotonic: float | None = None
 
     def _now_ms(self) -> int:
         return int(time.time() * 1000)
@@ -175,9 +180,10 @@ class CallRunner:
         self._record_transcript("agent", text, state=state, source=source)
         self._record_event("agent_turn", turn=self._turn, state=state)
 
-        if state is not None and (
+        state_changed = state is not None and (
             not self.result.trajectory or self.result.trajectory[-1].state != state
-        ):
+        )
+        if state_changed:
             self.result.trajectory.append(
                 TrajectoryEntry(
                     state=state,
@@ -188,7 +194,26 @@ class CallRunner:
             )
             self._record_event("state_transition", state=state, turn=self._turn)
 
+        if self.emotional is not None:
+            latency_s = (
+                time.monotonic() - self._last_reply_monotonic
+                if self._last_reply_monotonic is not None
+                else None
+            )
+            emo = self.emotional.update(
+                text, state_changed=state_changed, latency_s=latency_s
+            )
+            self._record_event(
+                "emotional_state",
+                turn=self._turn,
+                emotion=emo.emotion,
+                intensity=emo.intensity,
+                events=emo.events,
+                **({"action": emo.action} if emo.action else {}),
+            )
+
         reply = self.brain.reply(text)
         self._record_transcript("tester", reply)
         self._record_event("tester_turn", turn=self._turn)
         await self.transport.send_text(reply)
+        self._last_reply_monotonic = time.monotonic()

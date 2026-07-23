@@ -16,6 +16,21 @@ personas:
       freeTraits:
         - chama o atendente de "moço"
         - desconfiada com tecnologia, pede para repetirem
+    # PERSONAS-SOTA.md secao 3 — deltas/thresholds ja modulados p/ patience 2
+    emotionalModel:
+      initialEmotion: ansioso        # 2a ligacao sobre o mesmo problema
+      initialIntensity: 0.30
+      decayPerTurn: -0.05            # atendimento fluindo acalma
+      triggers:
+        - { "on": resolveu_etapa,          delta: -0.15 }
+        - { "on": repetiu_pergunta,        delta: 0.15 }
+        - { "on": pediu_dado_ja_informado, delta: 0.20 }   # "eu JA falei isso, uai"
+        - { "on": nao_entendeu_fala,       delta: 0.10 }
+        - { "on": jargao_tecnico,          delta: 0.10, emotion: confuso }
+        - { "on": latencia_alta,           delta: 0.10 }   # >3.5s de silencio
+        - { "on": transferiu,              delta: 0.25, emotion: irritado }
+        - { "on": pediu_desculpa,          delta: -0.10 }  # empatia acalma
+      thresholds: { pedirHumano: 0.75, desligar: 0.90 }
     demographics:
       ageBand: "41-60"
       region: mineiro
@@ -50,6 +65,20 @@ personas:
       freeTraits:
         - direto ao ponto
         - impaciente com scripts longos
+    # patience 3: escala mais devagar que a Marcia, mas explode com espera
+    emotionalModel:
+      initialEmotion: apressado
+      initialIntensity: 0.25
+      decayPerTurn: -0.04
+      triggers:
+        - { "on": resolveu_etapa,          delta: -0.12 }
+        - { "on": repetiu_pergunta,        delta: 0.10 }
+        - { "on": pediu_dado_ja_informado, delta: 0.15 }
+        - { "on": pediu_espera,            delta: 0.15 }
+        - { "on": latencia_alta,           delta: 0.20 }
+        - { "on": transferiu,              delta: 0.20, emotion: irritado }
+        - { "on": pediu_desculpa,          delta: -0.05 }
+      thresholds: { pedirHumano: 0.80, desligar: 0.95 }
     demographics:
       ageBand: "26-40"
       region: paulista

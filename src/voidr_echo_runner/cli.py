@@ -94,8 +94,12 @@ def _run(args: argparse.Namespace) -> int:
             flow_path = (REPO_ROOT / case.journey_flow).resolve()
         flow = load_journey_flow(flow_path)
 
+        from .emotional import EmotionalStateMachine
+
+        emotional = EmotionalStateMachine.for_persona(persona, seed=seed)
         brain = build_brain(args.brain, persona, case.goal, seed)
         if args.brain == "llm":
+            brain.emotional = emotional  # current state injected per turn
             # The history sent to the hive must carry massa as placeholders
             # (the gateway 422s on clear PII) — share the case deny-list.
             from .redaction import build_session_for_case
@@ -131,7 +135,9 @@ def _run(args: argparse.Namespace) -> int:
     run_id = args.run_id or f"{case.id}-{int(time.time())}"
     print(f"▶ case={case.id} persona={persona.id} seed={seed} target={args.target} mode={args.mode}")
 
-    runner = CallRunner(case, flow, brain, transport, receive_timeout=receive_timeout)
+    runner = CallRunner(
+        case, flow, brain, transport, receive_timeout=receive_timeout, emotional=emotional
+    )
 
     async def _run_call():
         try:
@@ -157,6 +163,12 @@ def _run(args: argparse.Namespace) -> int:
         "mode": args.mode,
         "target": args.target,
     }
+    if emotional.history:
+        meta["emotionalCurve"] = emotional.curve()
+        meta["emotionalFinal"] = {
+            "emotion": emotional.emotion,
+            "intensity": emotional.intensity,
+        }
     if args.mode == "audio" and recorder is not None:
         meta["audio"] = {
             "sttProvider": "deepgram",
