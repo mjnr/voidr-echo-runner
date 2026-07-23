@@ -254,12 +254,18 @@ def build_case(
     """Builds the runner-side VoiceTestCase + the resolved call target URL."""
     voice = case_doc.get("voice") or {}
     dial_plan_doc = voice.get("dialPlan") or {}
-    if not dial_plan_doc.get("to"):
-        raise ServeExecutionError(
-            f"case {target['testCaseSlug']} has no voice.dialPlan.to — cannot resolve the call target"
-        )
     captured: dict[str, str] = {}
-    call_target = resolve_params_placeholders(str(dial_plan_doc["to"]), params, captured)
+    # Environment-level target (ECHO_CALL_TARGET reserved key in
+    # ENVIRONMENT_PARAMS, service §8) overrides the case dialPlan `to`: the
+    # SAME cases run against the local ws:// mock or a real tel: number
+    # depending only on which environment the execution was dispatched to.
+    raw_target = params.get("ECHO_CALL_TARGET") or dial_plan_doc.get("to")
+    if not raw_target:
+        raise ServeExecutionError(
+            f"case {target['testCaseSlug']} has no voice.dialPlan.to and the "
+            "environment provides no ECHO_CALL_TARGET — cannot resolve the call target"
+        )
+    call_target = resolve_params_placeholders(str(raw_target), params, captured)
 
     steps = [
         DtmfStep(
@@ -268,6 +274,21 @@ def build_case(
         )
         for step in dial_plan_doc.get("dtmfSteps", [])
     ]
+    if not steps:
+        # Environment dial-plan defaults (IVR access code + ANI) for cases
+        # without their own DTMF steps — values may be {{env.X}} placeholders.
+        defaults = [
+            ("código de acesso", params.get("ECHO_DIAL_ACCESS_CODE")),
+            ("número da linha", params.get("ECHO_DIAL_ANI")),
+        ]
+        steps = [
+            DtmfStep(
+                wait_for_prompt_matching=wait_for,
+                send=resolve_params_placeholders(str(send), params, captured),
+            )
+            for wait_for, send in defaults
+            if send
+        ]
 
     flow_assert_doc = voice.get("flowAssert")
     if flow_assert_doc:
@@ -446,6 +467,7 @@ def build_session_payload(
     verdict: SessionVerdict,
     transcript_path: str | None,
     module_slug: str | None = None,
+    audio_path: str | None = None,
 ) -> dict:
     start = call.started_at_ms
 
@@ -491,8 +513,11 @@ def build_session_payload(
         payload["personaId"] = voice_config["personaId"]
     if voice_config.get("seed") is not None:
         payload["seed"] = voice_config["seed"]
-    if transcript_path:
-        payload["artifacts"] = {"transcriptPath": transcript_path}
+    if transcript_path or audio_path:
+        payload["artifacts"] = {
+            **({"transcriptPath": transcript_path} if transcript_path else {}),
+            **({"audioPath": audio_path} if audio_path else {}),
+        }
     return payload
 
 
@@ -581,10 +606,44 @@ def serve_execution(out_dir: Path) -> int:
             f"target={redaction.redact(call_target)}"
         )
 
+        # Call mode comes from the environment (ECHO_CALL_MODE, default text).
+        # tel:/PSTN targets are real calls and only exist in audio mode — same
+        # rule the pure CLI enforces.
+        mode = (params.get("ECHO_CALL_MODE") or "text").strip().lower()
+        is_pstn = call_target.startswith(("tel:", "+"))
+        if is_pstn and mode != "audio":
+            raise ServeExecutionError(
+                f"target {redaction.redact(call_target)} is a real phone number — "
+                "the environment must set voice mode 'audio' (ECHO_CALL_MODE)"
+            )
+
         brain = build_brain("scripted", persona, case.goal, seed)
-        transport = build_transport(call_target)
-        runner = CallRunner(case, flow, brain, transport)
-        call = asyncio.run(runner.run())
+        send_digits = None
+        if is_pstn and case.dial_plan.dtmf_steps:
+            # IVR digits at answer time, with `w` (0.5s) pauses between steps.
+            send_digits = "ww" + "ww".join(step.send for step in case.dial_plan.dtmf_steps)
+        transport = build_transport(call_target, send_digits=send_digits)
+        engine = recorder = None
+        receive_timeout = 10.0
+        if mode == "audio":
+            os.environ.setdefault("LOGURU_LEVEL", "WARNING")  # quiet pipecat logs
+            # Imports pipecat; validates DEEPGRAM/ELEVENLABS keys with clear errors.
+            from .audio import AudioTransportAdapter, PipecatAudioEngine, StereoCallRecorder
+
+            engine = PipecatAudioEngine(voice_id=persona.speech.voiceId)
+            recorder = StereoCallRecorder()
+            transport = AudioTransportAdapter(transport, engine, recorder)
+            receive_timeout = 45.0  # remote STT+TTS per turn
+        runner = CallRunner(case, flow, brain, transport, receive_timeout=receive_timeout)
+
+        async def _run_call():
+            try:
+                return await runner.run()
+            finally:
+                if engine is not None:
+                    await engine.aclose()
+
+        call = asyncio.run(_run_call())
         evaluation = evaluate_trajectory(
             case.assertion.flow,
             call.trajectory,
@@ -602,31 +661,47 @@ def serve_execution(out_dir: Path) -> int:
         verdict.deviations = redaction.redact_deep(verdict.deviations)
 
         run_id = f"{execution_id}-shard-{shard_index}"
-        report_path = write_artifacts(
-            out_dir,
-            run_id,
-            case.id,
-            call,
-            evaluation,
-            meta={
-                "persona": {"id": persona.id, "version": persona.version, "variantSeed": seed},
-                "journeyFlowId": flow.id,
-                **({"moduleSlug": case.module_slug} if case.module_slug else {}),
-                **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
-                "runnerVersion": __version__,
-                "mode": "text",
-                "target": redaction.redact(call_target),
-                "executionId": execution_id,
-                "shard": {"index": shard_index, "total": shard_total},
-                "piiRedactionReport": redaction.report(),
-            },
-        )
+        meta: dict[str, Any] = {
+            "persona": {"id": persona.id, "version": persona.version, "variantSeed": seed},
+            "journeyFlowId": flow.id,
+            **({"moduleSlug": case.module_slug} if case.module_slug else {}),
+            **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
+            "runnerVersion": __version__,
+            "mode": mode,
+            "target": redaction.redact(call_target),
+            "executionId": execution_id,
+            "shard": {"index": shard_index, "total": shard_total},
+        }
+        wav_path: Path | None = None
+        if mode == "audio" and recorder is not None:
+            meta["audio"] = {
+                "sttProvider": "deepgram",
+                "ttsProvider": "elevenlabs",
+                "voiceId": persona.speech.voiceId,
+                "sttTurns": transport.stt_turns,
+                "ttsTurns": transport.tts_turns,
+                "wavDurationMs": recorder.duration_ms,
+            }
+            # Audio PII redaction (§10): beeps over word-timestamps, writes
+            # call.redacted.wav — the raw recording is never persisted.
+            from .audio_redaction import redact_call_audio
+
+            audio_dir = out_dir / run_id
+            audio_dir.mkdir(parents=True, exist_ok=True)
+            meta["audio"].update(
+                redact_call_audio(recorder, transport.utterances, redaction, audio_dir)
+            )
+            meta["audio"]["wavFile"] = "call.redacted.wav"
+            wav_path = audio_dir / "call.redacted.wav"
+        meta["piiRedactionReport"] = redaction.report()
+        report_path = write_artifacts(out_dir, run_id, case.id, call, evaluation, meta=meta)
         run_dir = report_path.parent
 
         # Upload artifacts. The reporter JSON path is the one the service's
         # finalizeReport reads for VOICE shards.
         shard_prefix = f"org/{org_id}/executions/{execution_id}/shards/{shard_index}"
         transcript_key: str | None = None
+        audio_key: str | None = None
         try:
             api.upload_file(
                 f"{shard_prefix}/reporter/json/test-results.json",
@@ -643,6 +718,12 @@ def serve_execution(out_dir: Path) -> int:
                 (run_dir / "timeline.json").read_bytes(),
                 "application/json",
             )
+            if wav_path is not None and wav_path.exists():
+                audio_key = api.upload_file(
+                    f"{shard_prefix}/artifacts/call.redacted.wav",
+                    wav_path.read_bytes(),
+                    "audio/wav",
+                )
             print(f"  artifacts uploaded under {shard_prefix}/")
         except Exception as upload_error:  # noqa: BLE001 — report shard even if upload fails
             print(f"  artifact upload failed (continuing): {upload_error}", file=sys.stderr)
@@ -660,6 +741,7 @@ def serve_execution(out_dir: Path) -> int:
                     verdict,
                     transcript_key,
                     module_slug=case.module_slug,
+                    audio_path=audio_key,
                 )
             )
             print(f"  voice session recorded: {session.get('_id', '?')} status={verdict.status}")
