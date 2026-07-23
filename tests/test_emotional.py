@@ -213,7 +213,7 @@ def test_badge_format():
 # --- LLMBrain integration -------------------------------------------------------
 
 
-def test_llm_brain_injects_emotional_block_in_goal_template(monkeypatch):
+def test_llm_brain_sends_structured_emotional_state(monkeypatch):
     import httpx
     import json
 
@@ -238,7 +238,59 @@ def test_llm_brain_injects_emotional_block_in_goal_template(monkeypatch):
     brain.emotional.update("Pode me informar o seu CPF, por favor?")
     brain.reply("Pode me informar o seu CPF, por favor?")
 
-    goal_template = captured["body"]["persona"]["goalTemplate"]
-    assert "[ESTADO EMOCIONAL" in goal_template
-    assert "ansioso" in goal_template
-    assert "0.45" in goal_template  # 0.30 - 0.05 + 0.20
+    # Contract v2: structured field, no legacy block inside goalTemplate.
+    state = captured["body"]["emotionalState"]
+    assert state["emotion"] == "ansioso"
+    assert state["intensity"] == pytest.approx(0.45)  # 0.30 - 0.05 + 0.20
+    assert state["guidance"]
+    assert "[ESTADO EMOCIONAL" not in captured["body"]["persona"]["goalTemplate"]
+
+
+def test_llm_brain_falls_back_to_goal_template_on_400(monkeypatch):
+    import httpx
+    import json
+
+    for key, value in {
+        "HIVE_URL": "http://hive.test:3001",
+        "HIVE_GATEWAY_TOKEN": "t",
+        "VOIDR_ORG_ID": "org",
+    }.items():
+        monkeypatch.setenv(key, value)
+    from voidr_echo_runner.brain import LLMBrain
+
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "emotionalState" in body:  # old hive schema: rejects the new field
+            return httpx.Response(400, json={"error": "Invalid persona-turn payload"})
+        return httpx.Response(200, json={"text": "uai", "model": "m", "usage": {}})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    brain = LLMBrain(marcia(), goal="ver saldo", client=client)
+    brain.emotional = EmotionalStateMachine.for_persona(marcia(), seed=42)
+    brain.emotional.update("Pode me informar o seu CPF?")
+
+    assert brain.reply("Pode me informar o seu CPF?") == "uai"
+    assert len(bodies) == 2  # structured attempt, then legacy fallback
+    assert "emotionalState" not in bodies[1]
+    assert "[ESTADO EMOCIONAL" in bodies[1]["persona"]["goalTemplate"]
+    # Fallback is sticky: subsequent turns go straight to the legacy shape.
+    brain.reply("Certo, anotei.")
+    assert len(bodies) == 3
+    assert "emotionalState" not in bodies[2]
+
+
+def test_guidance_demands_human_at_threshold():
+    model = EmotionalModel(
+        initialEmotion="irritado",
+        initialIntensity=0.7,
+        triggers=[EmotionalTrigger(on="pediu_dado_ja_informado", delta=0.2)],
+        thresholds=EmotionalThresholds(pedirHumano=0.75, desligar=0.95),
+    )
+    machine = EmotionalStateMachine(model)
+    machine.update("Seu CPF?")
+    machine.update("Seu CPF de novo?")  # crosses pedirHumano
+    assert "DEVE exigir" in machine.guidance()
+    assert "atendente humano" in machine.guidance()

@@ -212,17 +212,31 @@ def flow_from_service(doc: dict) -> JourneyFlow:
 
 
 def persona_from_service(doc: dict) -> Persona:
+    identity = doc.get("identity") or {}
     return Persona.model_validate(
         {
             "id": doc.get("slug") or str(doc.get("_id")),
             "kind": doc.get("kind", "curated"),
             "version": doc.get("version", 1),
+            # Display name may carry "(58, mineira)" — the spoken identity is
+            # identity.shortName when the persona has the v2 block.
+            "name": identity.get("shortName") or doc.get("name", ""),
+            "age": doc.get("age"),
+            "gender": doc.get("gender", ""),
+            "profile": doc.get("profile"),
             "demographics": doc["demographics"],
             "temperament": doc["temperament"],
             "speech": doc["speech"],
             "goalTemplate": doc["goalTemplate"],
             "vocabulary": doc.get("vocabulary", []),
             "massaProfile": doc.get("massaProfile", ""),
+            # v2 blocks (schemaVersion 2) — shape 1:1 with the runner models,
+            # so the LLMBrain payload and the emotional machine use the same
+            # calibration whether the persona comes from YAML or the service.
+            "identity": doc.get("identity"),
+            "psychometrics": doc.get("psychometrics"),
+            "behaviors": doc.get("behaviors"),
+            "emotionalModel": doc.get("emotionalModel"),
         }
     )
 
@@ -468,6 +482,7 @@ def build_session_payload(
     transcript_path: str | None,
     module_slug: str | None = None,
     audio_path: str | None = None,
+    brain: str | None = None,
 ) -> dict:
     start = call.started_at_ms
 
@@ -503,6 +518,10 @@ def build_session_payload(
         "metrics": {"turns": call.agent_turns, "durationMs": call.duration_ms},
         "deviations": verdict.deviations,
     }
+    # Which brain produced the tester turns — `llm` triggers the service's
+    # persona-fidelity judge on this session (P0.4).
+    if brain:
+        payload["brain"] = brain
     # Canonical Journey (module) slug from the case — when absent the service
     # derives it from the execution's plan (fallback), so we simply omit it.
     if module_slug:
@@ -589,6 +608,10 @@ def serve_execution(out_dir: Path) -> int:
         if not persona_id:
             raise ServeExecutionError(f"case {target['testCaseSlug']} has no voice.personaId")
         persona = persona_from_service(api.get_persona(persona_id))
+        # Session convention is the persona SLUG (playground sessions, rollup
+        # indexes and the fidelity judge all key on it) — the plan's voice
+        # config stores the ObjectId, so report the resolved slug instead.
+        voice_config = {**voice_config, "personaId": persona.id}
 
         case, call_target = build_case(target, case_doc, persona.id, flow, params, plan_id)
         seed = voice_config.get("seed") or 0
@@ -620,7 +643,16 @@ def serve_execution(out_dir: Path) -> int:
         from .emotional import EmotionalStateMachine
 
         emotional = EmotionalStateMachine.for_persona(persona, seed=seed)
-        brain = build_brain("scripted", persona, case.goal, seed)
+        # Persona brain from the environment (ECHO_BRAIN, default scripted).
+        # llm = hive persona-turn (needs HIVE_* envs) — those sessions trigger
+        # the service's persona-fidelity judge.
+        brain_kind = (params.get("ECHO_BRAIN") or "scripted").strip().lower()
+        if brain_kind not in ("scripted", "llm"):
+            raise ServeExecutionError(f"invalid ECHO_BRAIN {brain_kind!r} (scripted|llm)")
+        brain = build_brain(brain_kind, persona, case.goal, seed)
+        if brain_kind == "llm":
+            brain.redaction = redaction  # deny-list of the case massa
+            brain.emotional = emotional  # structured emotionalState per turn
         send_digits = None
         if is_pstn and case.dial_plan.dtmf_steps:
             # IVR digits at answer time, with `w` (0.5s) pauses between steps.
@@ -673,6 +705,7 @@ def serve_execution(out_dir: Path) -> int:
             **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
             "runnerVersion": __version__,
             "mode": mode,
+            "brain": brain_kind,
             "target": redaction.redact(call_target),
             "executionId": execution_id,
             "shard": {"index": shard_index, "total": shard_total},
@@ -753,6 +786,7 @@ def serve_execution(out_dir: Path) -> int:
                     transcript_key,
                     module_slug=case.module_slug,
                     audio_path=audio_key,
+                    brain=brain_kind,
                 )
             )
             print(f"  voice session recorded: {session.get('_id', '?')} status={verdict.status}")

@@ -149,12 +149,14 @@ class LLMBrain:
         self.redaction = RedactionSession()
         # Optional deterministic emotional state machine (PERSONAS-SOTA P0.3).
         # The OWNER of the conversation loop (CallRunner/chat) updates it per
-        # agent turn; this brain only injects the current state in the prompt.
-        # The hive persona-turn contract has no emotionalState field yet, so
-        # the block rides inside goalTemplate (see README contract note).
+        # agent turn; this brain sends the current state as the structured
+        # `emotionalState` field (contract v2). Against an older hive that
+        # 400s on the field, we fall back once to the legacy workaround of
+        # embedding the [ESTADO EMOCIONAL] block in goalTemplate.
         from .emotional import EmotionalStateMachine
 
         self.emotional: EmotionalStateMachine | None = None
+        self._legacy_emotional = False
         self.total_cost_usd = 0.0
         self.last_model: str | None = None
         self.last_usage: dict[str, Any] | None = None
@@ -163,7 +165,8 @@ class LLMBrain:
         goal_template = self.persona.goalTemplate
         if self.goal and "{goal}" in goal_template:
             goal_template = goal_template.format(goal=self.goal)
-        if self.emotional is not None:
+        if self.emotional is not None and self._legacy_emotional:
+            # Legacy workaround for hives without the structured field.
             goal_template = f"{goal_template}\n\n{self.emotional.prompt_block()}"
         # Identity fields are optional in the contract, but when `name` is set
         # the hive locks the persona identity in the prompt (no more LLM
@@ -189,9 +192,41 @@ class LLMBrain:
             }
             if profile:
                 identity["profile"] = profile
+        # v2 blocks (contract v2, all optional): identity.facts is the judge's
+        # canonical truth; OCEAN and behaviors drive the prompt v2 blocks;
+        # emotionalModel sends only the subset the hive accepts (triggers and
+        # decay stay runner-side — the machine lives here).
+        v2: dict[str, Any] = {}
+        if self.persona.identity is not None:
+            ident = self.persona.identity
+            v2["identity"] = {
+                key: value
+                for key, value in (
+                    ("fullName", ident.fullName),
+                    ("shortName", ident.shortName),
+                    ("backstory", ident.backstory),
+                    ("facts", dict(ident.facts)),
+                )
+                if value
+            }
+        if self.persona.psychometrics is not None:
+            v2["psychometrics"] = self.persona.psychometrics.model_dump()
+        if self.persona.behaviors is not None:
+            v2["behaviors"] = self.persona.behaviors.model_dump()
+        if self.persona.emotionalModel is not None:
+            model = self.persona.emotionalModel
+            v2["emotionalModel"] = {
+                "initialEmotion": model.initialEmotion,
+                "initialIntensity": model.initialIntensity,
+                "thresholds": {
+                    "pedirHumano": model.thresholds.pedirHumano,
+                    "desligar": model.thresholds.desligar,
+                },
+            }
         return {
             "id": self.persona.id,
             **identity,
+            **v2,
             "demographics": {
                 "ageBand": self.persona.demographics.ageBand,
                 "region": self.persona.demographics.region,
@@ -208,17 +243,7 @@ class LLMBrain:
             "vocabulary": list(self.persona.vocabulary),
         }
 
-    def take_turn(self, agent_utterance: str, *, escalate: bool | None = None) -> dict[str, Any]:
-        """One persona turn; returns the full hive response (text/model/usage)."""
-        import httpx
-
-        self.history.append({"role": "agent", "text": agent_utterance})
-        options: dict[str, Any] = {}
-        effective_escalate = self.escalate_default if escalate is None else escalate
-        if effective_escalate:
-            options["escalate"] = True
-        if self.seed is not None:
-            options["seed"] = self.seed
+    def _build_payload(self, options: dict[str, Any]) -> dict[str, Any]:
         persona_payload = self._persona_payload()
         persona_payload["goalTemplate"] = self.redaction.redact(persona_payload["goalTemplate"])
         payload = {
@@ -231,7 +256,18 @@ class LLMBrain:
             ],
             **({"options": options} if options else {}),
         }
-        url = f"{self.base_url}/echo/persona-turn"
+        if self.emotional is not None and not self._legacy_emotional:
+            # Structured field (contract v2) — precedence over the legacy
+            # goalTemplate block on the hive side.
+            payload["emotionalState"] = {
+                "emotion": self.emotional.emotion,
+                "intensity": self.emotional.intensity,
+                "guidance": self.emotional.guidance(),
+            }
+        return payload
+
+    def _post(self, url: str, payload: dict[str, Any]) -> Any:
+        import httpx
 
         response = None
         last_exc: Exception | None = None
@@ -247,6 +283,26 @@ class LLMBrain:
             raise HiveError(
                 f"hive unreachable at {url}: {type(last_exc).__name__}: {last_exc}"
             ) from last_exc
+        return response
+
+    def take_turn(self, agent_utterance: str, *, escalate: bool | None = None) -> dict[str, Any]:
+        """One persona turn; returns the full hive response (text/model/usage)."""
+        self.history.append({"role": "agent", "text": agent_utterance})
+        options: dict[str, Any] = {}
+        effective_escalate = self.escalate_default if escalate is None else escalate
+        if effective_escalate:
+            options["escalate"] = True
+        if self.seed is not None:
+            options["seed"] = self.seed
+        url = f"{self.base_url}/echo/persona-turn"
+
+        payload = self._build_payload(options)
+        response = self._post(url, payload)
+        if response.status_code == 400 and "emotionalState" in payload:
+            # Old hive schema without the structured field: fall back to the
+            # legacy goalTemplate block for the rest of the session.
+            self._legacy_emotional = True
+            response = self._post(url, self._build_payload(options))
         if response.status_code != 200:
             detail = ""
             try:

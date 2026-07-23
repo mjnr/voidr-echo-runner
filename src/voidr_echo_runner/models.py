@@ -105,6 +105,35 @@ class PersonaProfile(BaseModel):
     freeTraits: list[str] = Field(default_factory=list)
 
 
+class PersonaIdentity(BaseModel):
+    """v2 identity block (PERSONAS-SOTA P0.1): canonical, judge-verifiable
+    facts — the antidote to persona drift. All values synthetic."""
+
+    fullName: str = ""
+    shortName: str = ""
+    backstory: str = ""
+    facts: dict[str, str] = Field(default_factory=dict)
+
+
+class Psychometrics(BaseModel):
+    """Big Five 0-100 (Big5-Scaler format)."""
+
+    openness: int
+    conscientiousness: int
+    extraversion: int
+    agreeableness: int
+    neuroticism: int
+
+
+class PersonaBehaviors(BaseModel):
+    """Non-collaborative behavior probabilities per turn (arXiv 2509.23124)."""
+
+    tangential: float = 0.05
+    outOfScopeRequest: float = 0.05
+    incompleteUtterance: float = 0.0
+    selfCorrection: float = 0.0
+
+
 class EmotionalTrigger(BaseModel):
     """Appraisal rule: event name -> intensity delta (optional emotion switch)."""
 
@@ -144,6 +173,9 @@ class Persona(BaseModel):
     age: int | None = None
     gender: str = ""
     profile: PersonaProfile | None = None
+    identity: PersonaIdentity | None = None
+    psychometrics: Psychometrics | None = None
+    behaviors: PersonaBehaviors | None = None
     emotionalModel: EmotionalModel | None = None
     demographics: Demographics
     temperament: Temperament

@@ -279,23 +279,25 @@ class EmotionalStateMachine:
         lines = [
             "[ESTADO EMOCIONAL — mantido pelo sistema de teste; siga à risca]",
             f"Emoção atual: {self.emotion} | Intensidade: {self.intensity:.2f}/1.0 ({direction})",
-            f"Manifestação: {self._guidance()}",
+            f"Manifestação: {self.guidance()}",
             "A mudança de humor é sempre gradual e motivada — nunca salte de calmo "
             "para furioso sem gatilho.",
         ]
         return "\n".join(lines)
 
-    def _guidance(self) -> str:
+    def guidance(self) -> str:
+        """Behavioral instruction for the current state — goes to the hive's
+        structured `emotionalState.guidance` (and to the legacy prompt block)."""
         last_action = self.history[-1].action if self.history else None
         if last_action == "desligar" or self._hung_up:
             return (
-                "limite final ultrapassado: despeça-se de forma seca e ENCERRE a "
-                "ligação neste turno."
+                "limite final ultrapassado: você DEVE se despedir de forma seca e "
+                "ENCERRAR a ligação neste turno."
             )
         if last_action == "pedir_humano":
             return (
-                "você acabou de cruzar seu limite: peça UMA vez, neste turno, para "
-                "falar com um atendente humano."
+                "você acabou de cruzar seu limite: você DEVE exigir falar com um "
+                "atendente humano agora, neste turno, uma única vez."
             )
         if self._asked_human:
             return (

@@ -103,6 +103,16 @@ def test_turn_payload_matches_contract(hive_env, persona):
     # freeTraits is a single string in the hive contract (catalog list joined)
     assert isinstance(p["profile"]["freeTraits"], str)
     assert 'chama o atendente de "moço"' in p["profile"]["freeTraits"]
+    # v2 blocks (contract v2): judge-verifiable identity, OCEAN, behaviors,
+    # and the emotionalModel subset the hive accepts (no triggers/decay —
+    # the state machine stays runner-side).
+    assert p["identity"]["shortName"] == "Márcia"
+    assert p["identity"]["facts"]["cidade"] == "Belo Horizonte"
+    assert p["psychometrics"]["neuroticism"] == 75  # persona-v2.util calibration
+    assert p["behaviors"]["incompleteUtterance"] == pytest.approx(0.15)
+    assert p["emotionalModel"]["initialEmotion"] == "ansioso"
+    assert p["emotionalModel"]["thresholds"] == {"pedirHumano": 0.75, "desligar": 0.90}
+    assert "triggers" not in p["emotionalModel"]
     assert p["demographics"] == {"ageBand": "41-60", "region": "mineiro"}
     assert p["temperament"]["mood"] == "ansioso"
     assert p["temperament"]["patienceLevel"] == 2

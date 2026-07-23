@@ -16,6 +16,30 @@ personas:
       freeTraits:
         - chama o atendente de "moço"
         - desconfiada com tecnologia, pede para repetirem
+    # v2 (PERSONAS-SOTA P0.1) — identidade 100% sintetica, facts sao o
+    # gabarito do fidelity judge (nunca contradizer)
+    identity:
+      fullName: Márcia Aparecida Ferreira
+      shortName: Márcia
+      backstory: >-
+        Aposentada, ex-merendeira de escola. Mora em Belo Horizonte, cliente
+        pré-pago da Vivo há muitos anos; usa o celular "pra zap e pra ligação".
+      facts:
+        cidade: Belo Horizonte
+        ocupacao: aposentada
+    # OCEAN calibrado igual a derivacao do service (persona-v2.util.ts):
+    # ansioso/patience 2/tech baixa/verbosity normal
+    psychometrics:
+      openness: 35
+      conscientiousness: 45
+      extraversion: 55
+      agreeableness: 62
+      neuroticism: 75
+    behaviors:                     # derivado de intentNoise=nenhum, disfluency 0.3
+      tangential: 0.05
+      outOfScopeRequest: 0.05
+      incompleteUtterance: 0.15
+      selfCorrection: 0.15
     # PERSONAS-SOTA.md secao 3 — deltas/thresholds ja modulados p/ patience 2
     emotionalModel:
       initialEmotion: ansioso        # 2a ligacao sobre o mesmo problema
@@ -65,6 +89,27 @@ personas:
       freeTraits:
         - direto ao ponto
         - impaciente com scripts longos
+    identity:
+      fullName: Carlos Eduardo Souza
+      shortName: Carlos
+      backstory: >-
+        Analista de logística, paulistano. Resolve tudo pelo app; só liga
+        quando o app não resolve — e quer desligar o quanto antes.
+      facts:
+        cidade: São Paulo
+        ocupacao: analista de logística
+    # OCEAN (persona-v2.util.ts): apressado/patience 3/tech alta/monossilabico
+    psychometrics:
+      openness: 65
+      conscientiousness: 55
+      extraversion: 30
+      agreeableness: 45
+      neuroticism: 55
+    behaviors:                     # intentNoise=nenhum, disfluency 0.1
+      tangential: 0.05
+      outOfScopeRequest: 0.05
+      incompleteUtterance: 0.05
+      selfCorrection: 0.05
     # patience 3: escala mais devagar que a Marcia, mas explode com espera
     emotionalModel:
       initialEmotion: apressado

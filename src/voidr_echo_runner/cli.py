@@ -162,6 +162,9 @@ def _run(args: argparse.Namespace) -> int:
         "runnerVersion": __version__,
         "mode": args.mode,
         "target": args.target,
+        # Which brain produced the tester turns — llm sessions are the
+        # trigger for the service's persona-fidelity judge (P0.4).
+        "brain": args.brain,
     }
     if emotional.history:
         meta["emotionalCurve"] = emotional.curve()

@@ -313,12 +313,15 @@ registrado e reservado para comportamentos estocásticos futuros, P1.2).
 - **Chat**: o rodapé de cada turno mostra `[emoção 0.45 ↗]`; `/emotion` imprime
   a curva completa com gatilhos e ações.
 
-**Pendência de contrato (hive):** o `POST /echo/persona-turn` ainda não tem
-campo estruturado para o estado emocional (o zod atual descartaria chaves
-desconhecidas silenciosamente), então o runner injeta o bloco
-`[ESTADO EMOCIONAL ...]` dentro do `goalTemplate` — compatível hoje. Quando o
-prompt v2 (P0.2 da spec) aceitar `emotionalState {emotion, intensity, guidance}`
-no contrato, mover a injeção para o campo dedicado.
+**Contrato v2 (hive `813fad6`):** o runner envia o campo estruturado
+`emotionalState {emotion, intensity, guidance}` no persona-turn (a `guidance`
+vem dos thresholds — ex.: "você DEVE exigir um atendente humano agora"). Se o
+hive responder `400` (schema antigo sem o campo), o `LLMBrain` cai uma vez para
+o workaround legado de embutir o bloco `[ESTADO EMOCIONAL]` no `goalTemplate` e
+mantém o modo legado pelo resto da sessão. O payload também leva os blocos v2
+da persona (`identity.facts`, `psychometrics` OCEAN, `behaviors` e o subset de
+`emotionalModel` que o hive aceita — triggers/decay ficam no runner). Sessões
+com `brain: llm` no report disparam o persona-fidelity judge no service.
 
 ## O que é stub / plugável
 
@@ -367,8 +370,15 @@ Fluxo executado:
    `testCaseResults` quando o último shard finaliza.
 6. **Sessão** — `POST /v1/echo/sessions` com transcript, trajetória, status
    (`passed | deviation | escalation | abandoned | env_failure` — mesma
-   precedência do `voice-eval.service.ts`), `deviations[]`, métricas e paths
-   dos artifacts.
+   precedência do `voice-eval.service.ts`), `deviations[]`, métricas, paths
+   dos artifacts, o slug da persona e `brain` (`scripted | llm`) — sessões
+   `llm` disparam o persona-fidelity judge no service (P0.4).
+
+O brain da persona vem de `ENVIRONMENT_PARAMS.ECHO_BRAIN` (`scripted` default,
+`llm` usa o persona-turn do hive — exige `HIVE_URL`/`HIVE_GATEWAY_TOKEN` no
+ambiente do processo). Com `llm`, o runner envia ao hive o `emotionalState`
+estruturado por turno e os blocos v2 da persona vindos do service
+(`identity.facts`, `psychometrics`, `behaviors`, `emotionalModel`).
 
 ### Envs do contrato
 

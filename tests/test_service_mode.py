@@ -170,3 +170,76 @@ def test_session_payload_omits_module_slug_when_absent():
         None,
     )
     assert "moduleSlug" not in payload
+
+
+# ── report payload: brain fires the persona-fidelity judge on llm sessions ───
+
+
+def test_session_payload_carries_brain_kind():
+    payload = build_session_payload(
+        "exec-1",
+        1,
+        "JORNA-01",
+        {},
+        _call_result(),
+        SessionVerdict(status="passed", deviations=[]),
+        None,
+        brain="llm",
+    )
+    assert payload["brain"] == "llm"
+
+
+def test_persona_from_service_maps_v2_blocks():
+    from voidr_echo_runner.service_mode import persona_from_service
+
+    persona = persona_from_service(
+        {
+            "_id": "6a0",
+            "slug": "dona-marcia-58-mineira",
+            "name": "Dona Márcia (58, mineira)",
+            "identity": {"shortName": "Márcia", "facts": {"cidade": "Belo Horizonte"}},
+            "psychometrics": {
+                "openness": 35,
+                "conscientiousness": 45,
+                "extraversion": 55,
+                "agreeableness": 62,
+                "neuroticism": 75,
+            },
+            "behaviors": {"incompleteUtterance": 0.15},
+            "emotionalModel": {
+                "initialEmotion": "ansioso",
+                "initialIntensity": 0.3,
+                "triggers": [{"on": "repetiu_pergunta", "delta": 0.15}],
+                "thresholds": {"pedirHumano": 0.74, "desligar": 0.89},
+            },
+            "demographics": {"ageBand": "41-60", "region": "mineiro"},
+            "temperament": {
+                "mood": "ansioso",
+                "patienceLevel": 2,
+                "techSavviness": "baixa",
+                "verbosity": "normal",
+                "intentNoise": "nenhum",
+            },
+            "speech": {"disfluencyRate": 0.3, "interruptionPolicy": "never", "fillers": []},
+            "goalTemplate": "quero {goal}",
+        }
+    )
+    assert persona.name == "Márcia"  # shortName wins over the display name
+    assert persona.identity.facts["cidade"] == "Belo Horizonte"
+    assert persona.psychometrics.neuroticism == 75
+    assert persona.behaviors.incompleteUtterance == 0.15
+    assert persona.emotionalModel.thresholds.pedirHumano == 0.74
+    assert persona.emotionalModel.triggers[0].on == "repetiu_pergunta"
+
+
+def test_session_payload_omits_brain_when_unset():
+    payload = build_session_payload(
+        "exec-1",
+        1,
+        "JORNA-01",
+        {},
+        _call_result(),
+        SessionVerdict(status="passed", deviations=[]),
+        None,
+    )
+    assert "brain" not in payload
