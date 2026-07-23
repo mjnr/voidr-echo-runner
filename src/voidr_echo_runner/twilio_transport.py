@@ -172,6 +172,7 @@ class TwilioMediaStreamTransport:
         self._inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._started = asyncio.Event()
         self._closed = False
+        self._ended = False  # far side sent Media Streams `stop`
         self._expect_reconnect = False
 
     @property
@@ -274,6 +275,7 @@ class TwilioMediaStreamTransport:
                     # <Connect><Stream> connection is on its way.
                     self._expect_reconnect = False
                     break
+                self._ended = True
                 self._inbox.put_nowait(
                     {"type": "event", "name": "call_ended", "reason": "completed"}
                 )
@@ -299,11 +301,27 @@ class TwilioMediaStreamTransport:
         except (TimeoutError, asyncio.TimeoutError):
             raise asyncio.TimeoutError from None
 
+    async def send_event(self, name: str, **fields: Any) -> None:
+        """No-op by design: PSTN has no side channel for protocol events.
+
+        `AudioTransportAdapter.connect()` sends `set_mode audio` for the local
+        mock's handshake; over Twilio the transport is audio-only, so the mode
+        is implicit and events are silently dropped."""
+
     async def send_audio(self, pcm: bytes, sample_rate: int = PIPELINE_SAMPLE_RATE) -> None:
-        """Stream PCM to the call in ~20ms Media Stream frames (paced)."""
+        """Stream PCM to the call in ~20ms Media Stream frames (paced).
+
+        Late sends are swallowed (same contract as LocalWebSocketTransport):
+        when the far side hangs up right after a terminal turn, the remaining
+        audio is dropped and `receive()` reports the call end — a completed
+        journey must not turn into a transport_error."""
+        import websockets
+
         from pipecat.frames.frames import OutputAudioRawFrame
 
         if self._ws is None or self._serializer is None:
+            if self._closed or self._ended:
+                return  # call already over; drop the late utterance
             raise RuntimeError("media stream is not connected")
         # Trailing silence flushes the serializer's stream resampler (which
         # buffers ~100ms) so the end of the utterance is not swallowed.
@@ -319,7 +337,10 @@ class TwilioMediaStreamTransport:
             )
             payload = await self._serializer.serialize(frame)
             if payload:
-                await self._ws.send(payload)
+                try:
+                    await self._ws.send(payload)
+                except websockets.ConnectionClosed:
+                    return  # line dropped mid-utterance; receive() drains the end
             sent_ms += OUT_CHUNK_MS
             # Pace slightly faster than real time; Twilio buffers a little.
             ahead_s = sent_ms / 1000 * 0.8 - (time.monotonic() - started)

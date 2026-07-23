@@ -147,6 +147,53 @@ def test_mid_call_dtmf_rejects_bad_digits(twilio_env):
         asyncio.run(transport.send_dtmf('"/><Hangup/>'))
 
 
+def test_send_event_is_noop(twilio_env):
+    """AudioTransportAdapter.connect() sends set_mode — over PSTN it must be
+    silently dropped (audio-only transport), never AttributeError."""
+    client = FakeTwilioClient()
+    transport = TwilioMediaStreamTransport("+5511999999999", client=client)
+    asyncio.run(transport.send_event("set_mode", mode="audio"))
+    assert client.log == []  # no REST call, no side effect
+
+
+def test_late_send_audio_after_call_end_is_swallowed(twilio_env):
+    """Far side hung up right after the terminal turn: audio is dropped, no error."""
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+    transport._ended = True  # media stream `stop` already processed
+    asyncio.run(transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 100)))  # no raise
+
+
+def test_late_send_audio_after_hangup_is_swallowed(twilio_env):
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+    asyncio.run(transport.hangup())
+    asyncio.run(transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 100)))  # no raise
+
+
+def test_send_audio_on_connection_closed_mid_send_is_swallowed(twilio_env):
+    """websockets.ConnectionClosedOK during the paced send must not propagate."""
+    from websockets.exceptions import ConnectionClosedOK
+
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+
+    class ClosedWs:
+        async def send(self, payload):
+            raise ConnectionClosedOK(None, None)
+
+    class FakeSerializer:
+        async def serialize(self, frame):
+            return '{"event":"media"}'
+
+    transport._ws = ClosedWs()
+    transport._serializer = FakeSerializer()
+    asyncio.run(transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 100)))  # no raise
+
+
+def test_send_audio_before_connect_still_raises(twilio_env):
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+    with pytest.raises(RuntimeError, match="not connected"):
+        asyncio.run(transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 100)))
+
+
 # --- Full connect + media stream round trip ------------------------------------
 
 

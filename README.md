@@ -225,7 +225,9 @@ Envs: `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER` e
 
 ```bash
 # terminal 1 — tunnel para a porta do Media Streams server (default 8990)
-cloudflared tunnel --url http://localhost:8990   # ou: ngrok http 8990
+# IMPORTANTE: use 127.0.0.1, não localhost — o cloudflared alterna para ::1
+# (IPv6) com localhost e gera 502 intermitente no tunnel.
+cloudflared tunnel --url http://127.0.0.1:8990   # ou: ngrok http 8990
 # copie a URL pública para o .env como TWILIO_STREAM_PUBLIC_URL=wss://<host>
 
 # terminal 2 — chamada real (SÓ nas janelas contratuais, com coordenação)
