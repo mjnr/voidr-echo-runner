@@ -9,6 +9,7 @@ from voidr_echo_runner.service_mode import (
     SessionVerdict,
     build_case,
     build_session_payload,
+    resolve_persona_plan_entry,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -123,6 +124,64 @@ def test_case_dtmf_steps_win_over_env_defaults():
     doc["voice"]["dialPlan"]["dtmfSteps"] = [{"waitFor": "código", "send": "111111"}]
     case, _ = build_case(_target(), doc, "p", _minimal_flow(), params)
     assert [s.send for s in case.dial_plan.dtmf_steps] == ["111111"]
+
+
+# ── ECHO_PERSONA_PLAN: persona/overrides por shard (multi-persona) ───────────
+
+
+def test_persona_plan_entry_resolves_by_shard():
+    import json as _json
+
+    plan = [
+        {"personaId": "dona-marcia-58-mineira", "overrides": {"patienceLevel": 1}},
+        {"personaId": "carlos-34-paulista"},
+    ]
+    params = {"ECHO_PERSONA_PLAN": _json.dumps(plan)}
+    assert resolve_persona_plan_entry(params, 1)["personaId"] == "dona-marcia-58-mineira"
+    assert resolve_persona_plan_entry(params, 1)["overrides"] == {"patienceLevel": 1}
+    assert resolve_persona_plan_entry(params, 2)["personaId"] == "carlos-34-paulista"
+
+
+def test_persona_plan_absent_or_short_falls_back_to_case_persona():
+    assert resolve_persona_plan_entry({}, 1) is None
+    assert resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": "[]"}, 1) is None
+    assert resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": '[{"personaId":"x"}]'}, 2) is None
+
+
+def test_persona_plan_malformed_json_never_breaks_the_call(capsys):
+    assert resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": "{broken"}, 1) is None
+    assert "ECHO_PERSONA_PLAN inválido" in capsys.readouterr().err
+
+
+def test_session_payload_records_overrides_and_source():
+    payload = build_session_payload(
+        "exec-1",
+        2,
+        "JORNA-01",
+        {"journeyFlowId": "flow-1", "personaId": "carlos-34-paulista"},
+        _call_result(),
+        SessionVerdict(status="passed", deviations=[]),
+        None,
+        brain="llm",
+        persona_overrides={"initialEmotion": "irritado", "patienceLevel": 1},
+        persona_source="execution",
+    )
+    assert payload["personaOverrides"] == {"initialEmotion": "irritado", "patienceLevel": 1}
+    assert payload["personaSource"] == "execution"
+
+
+def test_session_payload_omits_override_fields_when_unset():
+    payload = build_session_payload(
+        "exec-1",
+        1,
+        "JORNA-01",
+        {"journeyFlowId": "flow-1"},
+        _call_result(),
+        SessionVerdict(status="passed", deviations=[]),
+        None,
+    )
+    assert "personaOverrides" not in payload
+    assert "personaSource" not in payload
 
 
 def test_session_payload_carries_audio_artifact():

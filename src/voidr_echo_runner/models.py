@@ -97,6 +97,13 @@ class Speech(BaseModel):
     backgroundNoise: str | None = None
     disfluencyRate: float = 0.0
     interruptionPolicy: str | None = None
+    # v2 regional register (PERSONAS-SOTA P0.1) — the hive persona-turn
+    # contract accepts all of these; leaving them out of the payload was the
+    # gap that made personas sound generic regardless of configuration.
+    discourseMarkers: list[str] = Field(default_factory=list)
+    fillerInventory: list[str] = Field(default_factory=list)
+    pronouns: str | None = None
+    exemplars: list[str] = Field(default_factory=list)
 
 
 class PersonaProfile(BaseModel):
@@ -189,7 +196,10 @@ class Persona(BaseModel):
     demographics: Demographics
     temperament: Temperament
     speech: Speech
-    goalTemplate: str
+    # DEPRECATED as an embedded problem: the persona defines WHO the person
+    # is; the call OBJECTIVE comes from the journey (case goal). Kept optional
+    # for legacy personas — when the journey provides a goal it wins.
+    goalTemplate: str = ""
     vocabulary: list[str] = Field(default_factory=list)
     massaProfile: str = ""
 

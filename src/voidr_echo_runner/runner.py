@@ -202,6 +202,18 @@ class CallRunner:
             )
             self._record_event("state_transition", state=state, turn=self._turn)
 
+        # Journey context for the LLM persona (mission delivery 2): keep the
+        # brain's journeyState in sync with the classified flow state — same
+        # wiring the chat mode does. Without this the persona-turn prompt ran
+        # the whole call on the generic "conversa-livre" state.
+        if state is not None and hasattr(self.brain, "journey_state"):
+            state_def = self.flow.states.get(state)
+            self.brain.journey_state = {
+                "flowSlug": self.flow.id,
+                "currentState": state,
+                "expects": list(state_def.expects) if state_def else [],
+            }
+
         if self.emotional is not None:
             latency_s = (
                 time.monotonic() - self._last_reply_monotonic

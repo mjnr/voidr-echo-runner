@@ -159,6 +159,103 @@ def test_payload_omits_identity_when_persona_has_none(hive_env, persona):
         assert key not in p
 
 
+def test_payload_carries_full_speech_v2_block(hive_env, persona):
+    """Regional register (markers, fillers, pronoun axis, exemplars) must
+    reach the hive — sending only disfluencyRate flattened every persona."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    rich = persona.model_copy(deep=True)
+    rich.speech.discourseMarkers = ["uai", "sô", "né"]
+    rich.speech.fillerInventory = ["é...", "deixa eu ver..."]
+    rich.speech.pronouns = "ce"
+    rich.speech.exemplars = ["Uai, mas o trem tá caro, sô."]
+    rich.speech.interruptionPolicy = "interrompe quando irritada"
+    LLMBrain(rich, goal="g", client=_client(handler)).reply("oi")
+
+    speech = captured["body"]["persona"]["speech"]
+    assert speech["discourseMarkers"] == ["uai", "sô", "né"]
+    assert speech["fillerInventory"] == ["é...", "deixa eu ver..."]
+    assert speech["pronouns"] == "ce"
+    assert speech["exemplars"] == ["Uai, mas o trem tá caro, sô."]
+    assert speech["interruptionPolicy"] == "interrompe quando irritada"
+    assert speech["disfluencyRate"] == pytest.approx(0.3)
+
+
+def test_journey_goal_travels_separate_from_persona(hive_env, persona):
+    """Delivery 4: the objective comes from the JOURNEY (`journeyGoal`), not
+    from the persona template."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    LLMBrain(persona, goal="consultar o saldo do plano", client=_client(handler)).reply("oi")
+    assert captured["body"]["journeyGoal"] == "consultar o saldo do plano"
+
+
+def test_empty_goal_template_falls_back_to_journey_goal(hive_env, persona):
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    decoupled = persona.model_copy(update={"goalTemplate": ""})
+    LLMBrain(decoupled, goal="bloquear a linha", client=_client(handler)).reply("oi")
+    body = captured["body"]
+    assert body["persona"]["goalTemplate"] == "bloquear a linha"  # old-hive min(1) safety
+    assert body["journeyGoal"] == "bloquear a linha"
+
+
+def test_execution_overrides_block_reaches_the_hive(hive_env, persona):
+    from voidr_echo_runner.overrides import PersonaOverrides
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    brain = LLMBrain(persona, goal="g", client=_client(handler))
+    brain.execution_overrides = PersonaOverrides(
+        patienceLevel=1, spice="cliente_com_pressa"
+    )
+    brain.reply("oi")
+
+    block = captured["body"]["executionOverrides"]
+    assert any("paciência: 1/5" in line for line in block["summary"])
+    assert "pressa" in block["spice"]
+
+
+def test_legacy_hive_fallback_embeds_journey_goal(hive_env, persona):
+    """A hive without the v2.1 fields 400s once; the brain retries embedding
+    the journey goal into goalTemplate and stays degraded for the session."""
+    bodies: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "journeyGoal" in body or "executionOverrides" in body:
+            return httpx.Response(400, json={"error": "Invalid persona-turn payload"})
+        return _ok_response()
+
+    brain = LLMBrain(persona, goal="consultar saldo", client=_client(handler))
+    assert brain.reply("oi") == "Uai, meu saldo sumiu, moço!"
+    assert len(bodies) == 2
+    assert "journeyGoal" not in bodies[1]
+    assert "Objetivo desta ligação (definido pela jornada): consultar saldo" in (
+        bodies[1]["persona"]["goalTemplate"]
+    )
+    brain.reply("segundo turno")  # stays degraded — no extra 400 roundtrip
+    assert len(bodies) == 3
+    assert "journeyGoal" not in bodies[2]
+
+
 def test_history_accumulates_and_cost_sums(hive_env, persona):
     brain = LLMBrain(persona, goal="g", client=_client(lambda _: _ok_response()))
     brain.reply("primeiro turno")

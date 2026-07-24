@@ -157,14 +157,36 @@ class LLMBrain:
 
         self.emotional: EmotionalStateMachine | None = None
         self._legacy_emotional = False
+        # Ephemeral execution overrides (overrides.PersonaOverrides): the
+        # already-applied persona carries the mechanical effects (thresholds,
+        # temperament); this block tells the PROMPT the variation explicitly
+        # so adherence is verifiable by the fidelity judge. Against an older
+        # hive that 400s on the new fields we degrade once (contract v2.1).
+        self.execution_overrides: Any | None = None
+        self._legacy_contract = False
         self.total_cost_usd = 0.0
         self.last_model: str | None = None
         self.last_usage: dict[str, Any] | None = None
 
     def _persona_payload(self) -> dict[str, Any]:
+        # Objective decoupling (mission delivery 4): the persona says WHO the
+        # person is; the objective comes from the JOURNEY (case goal) and is
+        # sent as the separate `journeyGoal` field. goalTemplate survives only
+        # as legacy style/fallback: `{goal}` placeholders are still resolved,
+        # and an empty template falls back to the journey goal so older hives
+        # (min 1 char) keep working.
         goal_template = self.persona.goalTemplate
         if self.goal and "{goal}" in goal_template:
             goal_template = goal_template.format(goal=self.goal)
+        if not goal_template.strip():
+            goal_template = self.goal or "Resolver o objetivo desta ligação."
+        if self._legacy_contract and self.goal:
+            # Old hive without `journeyGoal`: make the journey objective win
+            # by prepending it to the only field the old prompt reads.
+            goal_template = (
+                f"Objetivo desta ligação (definido pela jornada): {self.goal}\n\n"
+                f"{goal_template}"
+            )
         if self.emotional is not None and self._legacy_emotional:
             # Legacy workaround for hives without the structured field.
             goal_template = f"{goal_template}\n\n{self.emotional.prompt_block()}"
@@ -223,6 +245,20 @@ class LLMBrain:
                     "desligar": model.thresholds.desligar,
                 },
             }
+        # Full v2 speech block: regional particles, hesitations, tu/você axis
+        # and curated exemplars. Sending only disfluencyRate was the gap that
+        # flattened every persona into the same generic caller.
+        speech: dict[str, Any] = {"disfluencyRate": self.persona.speech.disfluencyRate}
+        if self.persona.speech.interruptionPolicy:
+            speech["interruptionPolicy"] = self.persona.speech.interruptionPolicy
+        if self.persona.speech.discourseMarkers:
+            speech["discourseMarkers"] = list(self.persona.speech.discourseMarkers)
+        if self.persona.speech.fillerInventory:
+            speech["fillerInventory"] = list(self.persona.speech.fillerInventory)
+        if self.persona.speech.pronouns:
+            speech["pronouns"] = self.persona.speech.pronouns
+        if self.persona.speech.exemplars:
+            speech["exemplars"] = list(self.persona.speech.exemplars)[:8]
         return {
             "id": self.persona.id,
             **identity,
@@ -238,7 +274,7 @@ class LLMBrain:
                 "verbosity": self.persona.temperament.verbosity,
                 "intentNoise": self.persona.temperament.intentNoise,
             },
-            "speech": {"disfluencyRate": self.persona.speech.disfluencyRate},
+            "speech": speech,
             "goalTemplate": goal_template,
             "vocabulary": list(self.persona.vocabulary),
         }
@@ -264,6 +300,22 @@ class LLMBrain:
                 "intensity": self.emotional.intensity,
                 "guidance": self.emotional.guidance(),
             }
+        if not self._legacy_contract:
+            # Contract v2.1: objective decoupled from the persona + ephemeral
+            # execution variation. Older hives 400 on unknown fields → the
+            # caller degrades once via _legacy_contract.
+            if self.goal:
+                payload["journeyGoal"] = self.redaction.redact(self.goal)
+            if self.execution_overrides is not None:
+                summary = self.execution_overrides.summary_lines()
+                spice = self.execution_overrides.spice_instruction()
+                block: dict[str, Any] = {}
+                if summary:
+                    block["summary"] = summary
+                if spice:
+                    block["spice"] = spice
+                if block:
+                    payload["executionOverrides"] = block
         return payload
 
     def _post(self, url: str, payload: dict[str, Any]) -> Any:
@@ -302,7 +354,16 @@ class LLMBrain:
             # Old hive schema without the structured field: fall back to the
             # legacy goalTemplate block for the rest of the session.
             self._legacy_emotional = True
-            response = self._post(url, self._build_payload(options))
+            payload = self._build_payload(options)
+            response = self._post(url, payload)
+        if response.status_code == 400 and (
+            "journeyGoal" in payload or "executionOverrides" in payload
+        ):
+            # Old hive schema without the v2.1 fields: embed the journey goal
+            # into goalTemplate for the rest of the session.
+            self._legacy_contract = True
+            payload = self._build_payload(options)
+            response = self._post(url, payload)
         if response.status_code != 200:
             detail = ""
             try:

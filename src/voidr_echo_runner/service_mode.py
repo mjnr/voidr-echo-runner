@@ -472,6 +472,30 @@ def classify_session(
     return SessionVerdict(status=status, deviations=deviations)
 
 
+def resolve_persona_plan_entry(
+    params: dict[str, str], shard_index: int
+) -> dict[str, Any] | None:
+    """Per-shard persona assignment from ENVIRONMENT_PARAMS.ECHO_PERSONA_PLAN.
+
+    The service serializes one JSON array aligned with the execution targets
+    (shard N reads entry N-1): `[{"personaId": "...", "overrides": {...}}]`.
+    Absent/short/broken plans mean "use the case's own persona" — a malformed
+    plan must never fail the call, only fall back loudly.
+    """
+    raw = params.get("ECHO_PERSONA_PLAN")
+    if not raw:
+        return None
+    try:
+        plan = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        print(f"  ECHO_PERSONA_PLAN inválido (ignorando): {exc}", file=sys.stderr)
+        return None
+    if not isinstance(plan, list) or shard_index < 1 or shard_index > len(plan):
+        return None
+    entry = plan[shard_index - 1]
+    return entry if isinstance(entry, dict) else None
+
+
 def build_session_payload(
     execution_id: str,
     shard_index: int,
@@ -483,6 +507,8 @@ def build_session_payload(
     module_slug: str | None = None,
     audio_path: str | None = None,
     brain: str | None = None,
+    persona_overrides: dict[str, Any] | None = None,
+    persona_source: str | None = None,
 ) -> dict:
     start = call.started_at_ms
 
@@ -530,6 +556,12 @@ def build_session_payload(
         payload["journeyFlowId"] = voice_config["journeyFlowId"]
     if voice_config.get("personaId"):
         payload["personaId"] = voice_config["personaId"]
+    # Ephemeral variation of this run (mission delivery 1): recorded verbatim
+    # so the session detail shows the knobs and the fidelity judge audits them.
+    if persona_overrides:
+        payload["personaOverrides"] = persona_overrides
+    if persona_source:
+        payload["personaSource"] = persona_source
     if voice_config.get("seed") is not None:
         payload["seed"] = voice_config["seed"]
     if transcript_path or audio_path:
@@ -559,6 +591,14 @@ def serve_execution(out_dir: Path) -> int:
     shard_index = int(os.environ.get("SHARDS_CURRENT", "1"))
     shard_total = int(os.environ.get("SHARDS_TOTAL", "1"))
     params: dict[str, str] = json.loads(os.environ.get("ENVIRONMENT_PARAMS", "{}") or "{}")
+
+    # The environment may pin the hive endpoint per execution (dev parity: the
+    # local dispatch spawns the runner with a minimal env, so the repo .env —
+    # loaded by the CLI before this point — would silently win over the
+    # environment's intent). ENVIRONMENT_PARAMS is authoritative job config.
+    for hive_key in ("HIVE_URL", "HIVE_GATEWAY_TOKEN"):
+        if params.get(hive_key):
+            os.environ[hive_key] = params[hive_key]
 
     token = os.environ.get("VOIDR_ACCESS_TOKEN")
     if not token:
@@ -604,10 +644,26 @@ def serve_execution(out_dir: Path) -> int:
             raise ServeExecutionError(f"case {target['testCaseSlug']} has no voice.journeyFlowId")
         flow = flow_from_service(api.get_journey_flow(journey_flow_id))
 
+        # Persona per execution (mission delivery 1/5): the execution may pin
+        # a DIFFERENT persona for this shard (multi-persona runs) and carry
+        # ephemeral overrides. Falls back to the case's own persona.
+        plan_entry = resolve_persona_plan_entry(params, shard_index) or {}
+        persona_source = "flow"
         persona_id = voice_config.get("personaId")
+        if plan_entry.get("personaId"):
+            persona_id = str(plan_entry["personaId"])
+            persona_source = "execution"
         if not persona_id:
             raise ServeExecutionError(f"case {target['testCaseSlug']} has no voice.personaId")
         persona = persona_from_service(api.get_persona(persona_id))
+
+        from .overrides import PersonaOverrides, apply_overrides
+
+        overrides = PersonaOverrides.model_validate(plan_entry.get("overrides") or {})
+        persona_overrides_record = overrides.as_record()
+        if persona_overrides_record:
+            persona = apply_overrides(persona, overrides)
+            persona_source = "execution"
         # Session convention is the persona SLUG (playground sessions, rollup
         # indexes and the fidelity judge all key on it) — the plan's voice
         # config stores the ObjectId, so report the resolved slug instead.
@@ -653,6 +709,9 @@ def serve_execution(out_dir: Path) -> int:
         if brain_kind == "llm":
             brain.redaction = redaction  # deny-list of the case massa
             brain.emotional = emotional  # structured emotionalState per turn
+            if persona_overrides_record:
+                # Prompt-visible variation block (adherence is judge-verified).
+                brain.execution_overrides = overrides
         send_digits = None
         if is_pstn and case.dial_plan.dtmf_steps:
             # IVR digits at answer time, with `w` (0.5s) pauses between steps.
@@ -734,7 +793,13 @@ def serve_execution(out_dir: Path) -> int:
 
         run_id = f"{execution_id}-shard-{shard_index}"
         meta: dict[str, Any] = {
-            "persona": {"id": persona.id, "version": persona.version, "variantSeed": seed},
+            "persona": {
+                "id": persona.id,
+                "version": persona.version,
+                "variantSeed": seed,
+                "source": persona_source,
+                **({"overrides": persona_overrides_record} if persona_overrides_record else {}),
+            },
             "journeyFlowId": flow.id,
             **({"moduleSlug": case.module_slug} if case.module_slug else {}),
             **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
@@ -822,6 +887,8 @@ def serve_execution(out_dir: Path) -> int:
                     module_slug=case.module_slug,
                     audio_path=audio_key,
                     brain=brain_kind,
+                    persona_overrides=persona_overrides_record or None,
+                    persona_source=persona_source,
                 )
             )
             print(f"  voice session recorded: {session.get('_id', '?')} status={verdict.status}")
