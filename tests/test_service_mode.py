@@ -232,6 +232,39 @@ def test_persona_from_service_maps_v2_blocks():
     assert persona.emotionalModel.triggers[0].on == "repetiu_pergunta"
 
 
+def test_persona_from_service_accepts_free_traits_string():
+    # The service stores profile.freeTraits as a single "a; b" string (hive
+    # contract); the runner model must coerce it into a list.
+    from voidr_echo_runner.service_mode import persona_from_service
+
+    persona = persona_from_service(
+        {
+            "_id": "6a1",
+            "slug": "seu-raimundo-62-cearense",
+            "name": "Seu Raimundo",
+            "profile": {
+                "occupation": "comerciante",
+                "context": "Fortaleza",
+                "freeTraits": 'fala devagar; trata todo mundo por "meu rei"',
+            },
+            "demographics": {"ageBand": "60+", "region": "cearense"},
+            "temperament": {
+                "mood": "calmo",
+                "patienceLevel": 4,
+                "techSavviness": "baixa",
+                "verbosity": "prolixo",
+                "intentNoise": "nenhum",
+            },
+            "speech": {"disfluencyRate": 0.2},
+            "goalTemplate": "quero {goal}",
+        }
+    )
+    assert persona.profile.freeTraits == [
+        "fala devagar",
+        'trata todo mundo por "meu rei"',
+    ]
+
+
 def test_session_payload_omits_brain_when_unset():
     payload = build_session_payload(
         "exec-1",

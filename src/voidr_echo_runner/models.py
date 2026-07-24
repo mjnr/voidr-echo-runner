@@ -6,7 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 from .textutil import resolve_placeholders_deep
 
@@ -103,6 +103,15 @@ class PersonaProfile(BaseModel):
     occupation: str = ""
     context: str = ""
     freeTraits: list[str] = Field(default_factory=list)
+
+    @field_validator("freeTraits", mode="before")
+    @classmethod
+    def _coerce_free_traits(cls, v: object) -> object:
+        # The service stores freeTraits as a single "a; b; c" string (hive
+        # contract); the local catalog YAML uses a list. Accept both.
+        if isinstance(v, str):
+            return [part.strip() for part in v.split(";") if part.strip()]
+        return v
 
 
 class PersonaIdentity(BaseModel):
