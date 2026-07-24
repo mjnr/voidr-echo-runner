@@ -295,6 +295,8 @@ class AudioTransportAdapter:
         self.tts_turns = 0
         # (segment_index, speaker, text) — feeds the post-call audio redactor.
         self.utterances: list[tuple[int, str, str]] = []
+        # Optional LivePublisher: per-utterance turn_audio for the live UI.
+        self.live: Any | None = None
 
     @property
     def url(self) -> str:
@@ -309,6 +311,10 @@ class AudioTransportAdapter:
         segment = self.recorder.add("tester", pcm)
         self.utterances.append((segment, "tester", text))
         self.tts_turns += 1
+        if self.live is not None:
+            # the tester `turn` was already recorded by CallRunner — the
+            # publisher pairs this audio with that turnIndex immediately
+            self.live.add_turn_audio("tester", pcm, self.engine.sample_rate)
         await self.inner.send_audio(pcm, sample_rate=self.engine.sample_rate)
 
     async def send_dtmf(self, digits: str) -> None:
@@ -331,6 +337,12 @@ class AudioTransportAdapter:
             text = await self.engine.transcribe(pcm)
             self.utterances.append((segment, msg.get("speaker", "agent"), text))
             self.stt_turns += 1
+            if self.live is not None:
+                # the matching `turn` is only recorded when CallRunner sees
+                # this message — the publisher holds the audio until then
+                self.live.add_turn_audio(
+                    msg.get("speaker", "agent"), pcm, self.engine.sample_rate
+                )
             return {
                 "type": "text",
                 "speaker": msg.get("speaker", "agent"),

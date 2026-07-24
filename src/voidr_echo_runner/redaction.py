@@ -279,22 +279,16 @@ class RedactionSession:
 
     # -- detection -------------------------------------------------------------
 
-    def find_spans(self, text: str) -> list[Span]:
-        """All PII spans in `text` (original offsets), deny-list first."""
-        # (start, end, type, entity key) — placeholders are only allocated for
-        # the spans that survive overlap resolution (keeps report() honest).
+    def _deny_candidates(self, text: str) -> list[tuple[int, int, str, str]]:
+        """Deny-list matches only: exact (fold-insensitive) + dictated digits."""
         candidates: list[tuple[int, int, str, str]] = []
         folded = fold(text)
-
-        # 1. deny-list, exact (fold-insensitive) value match
         for entry in self._deny:
             needle = fold(entry.value)
             start = 0
             while (idx := folded.find(needle, start)) != -1:
                 candidates.append((idx, idx + len(needle), f"MASSA_{entry.name}", entry.value))
                 start = idx + len(needle)
-
-        # 2. number runs: deny digits (fuzzy/spoken) then generic classifiers.
         for run in scan_number_runs(text):
             deny_hit = next(
                 (e for e in self._deny if e.digits and e.digits in run.digits), None
@@ -305,6 +299,19 @@ class RedactionSession:
                 candidates.append(
                     (run.start, run.end, f"MASSA_{deny_hit.name}", deny_hit.value)
                 )
+        return candidates
+
+    def find_spans(self, text: str) -> list[Span]:
+        """All PII spans in `text` (original offsets), deny-list first."""
+        # (start, end, type, entity key) — placeholders are only allocated for
+        # the spans that survive overlap resolution (keeps report() honest).
+        candidates = self._deny_candidates(text)
+        deny_ranges = {(start, end) for start, end, _t, _k in candidates}
+
+        # 2. number runs: generic classifiers (deny hits already collected win
+        # overlap resolution; skip them so counts stay identical to before).
+        for run in scan_number_runs(text):
+            if (run.start, run.end) in deny_ranges:
                 continue
             pii_type = classify_run(run, text)
             if pii_type is not None:
@@ -330,6 +337,19 @@ class RedactionSession:
 
     def redact(self, text: str) -> str:
         return self.redact_with_spans(text)[0]
+
+    def redact_deny(self, text: str) -> str:
+        """Deny-list-only redaction (no generic detectors) — used by the live
+        event stream, where massa must never leave the process but generic
+        false positives would garble the real-time transcript."""
+        spans = [
+            Span(start, end, pii_type, self._placeholder(pii_type, key))
+            for start, end, pii_type, key in _drop_overlaps(self._deny_candidates(text))
+        ]
+        redacted = text
+        for span in sorted(spans, key=lambda s: s.start, reverse=True):
+            redacted = redacted[: span.start] + span.placeholder + redacted[span.end :]
+        return redacted
 
     def redact_deep(self, obj: Any) -> Any:
         """Recursively redact every string in a JSON-like structure."""

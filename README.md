@@ -395,6 +395,29 @@ estruturado por turno e os blocos v2 da persona vindos do service
 
 \* obrigatório se `VOIDR_ACCESS_TOKEN` não vier.
 
+### Eventos live (`POST /v1/echo/live/{executionId}/events`)
+
+Durante a chamada o runner emite eventos em tempo real para a UI ("robô
+falando com robô"): `phase` (dialing → ura → agent → ended), `turn`
+(speaker/texto/turnIndex), `turn_audio` (utterance WAV mono 16k em base64,
+junto com o `turn` correspondente), `dtmf_sent`, `state_transition`,
+`emotional_state` e `call_ended` (com o status avaliado da sessão). Batches de
+até 5 eventos (1 de áudio por batch) a cada ~300ms, com `seq` crescente e
+`tsMs` relativo ao início da chamada — implementado em `live_events.py`.
+
+- **Ativação**: default ON no `serve-execution` (desligue com `ECHO_LIVE=0`
+  no ambiente ou nos `ENVIRONMENT_PARAMS`); OFF no `run` local salvo `--live`
+  (usa `VOIDR_API_URL` + `EXECUTION_ID`, com fallback para o run id).
+- **Fire-and-forget**: falha de rede nunca bloqueia nem derruba a chamada —
+  o batch é retentado 2x e descartado (warning no stderr); um circuit-breaker
+  desliga o publisher na sessão se o endpoint 404ar (ainda não deployado) ou
+  falhar 5 batches seguidos.
+- **Privacidade**: o TEXTO dos eventos (`turn`, `dtmf_sent`) passa pela
+  deny-list de massas (`{{env.*}}` conhecidos no runtime) antes de sair do
+  processo. O ÁUDIO live NÃO é redigido (a redação de áudio é pós-call):
+  em chamadas com massas reais sensíveis faladas em voz, desligue só o áudio
+  live com `ECHO_LIVE_AUDIO=0` — os eventos semânticos continuam fluindo.
+
 ### Dev local (sem GKE)
 
 O voidr-service com `ECHO_LOCAL_RUNNER_SCRIPT=<path>/scripts/serve-execution.sh`

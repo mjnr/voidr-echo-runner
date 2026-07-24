@@ -43,6 +43,14 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="DEV ONLY: skip PII redaction of artifacts (never use with real massas)",
     )
+    run.add_argument(
+        "--live",
+        action="store_true",
+        help=(
+            "emit live call events to the service (needs VOIDR_API_URL; "
+            "executionId = EXECUTION_ID env or the run id)"
+        ),
+    )
 
     chat = sub.add_parser(
         "chat",
@@ -135,14 +143,47 @@ def _run(args: argparse.Namespace) -> int:
     run_id = args.run_id or f"{case.id}-{int(time.time())}"
     print(f"▶ case={case.id} persona={persona.id} seed={seed} target={args.target} mode={args.mode}")
 
+    live = None
+    if args.live:
+        import os
+
+        api_url = os.environ.get("VOIDR_API_URL")
+        if not api_url:
+            print("⚠ --live ignorado: VOIDR_API_URL não definido", file=sys.stderr)
+        else:
+            from .live_events import LivePublisher
+            from .redaction import build_session_for_case as _build_deny
+
+            live = LivePublisher(
+                api_url,
+                os.environ.get("EXECUTION_ID") or run_id,
+                1,
+                token=os.environ.get("VOIDR_ACCESS_TOKEN"),
+                # live text passes the massa deny-list even with --no-redaction
+                redact=_build_deny(case).redact_deny,
+                audio_enabled=os.environ.get("ECHO_LIVE_AUDIO", "1") != "0",
+            )
+            if args.mode == "audio":
+                transport.live = live
+
     runner = CallRunner(
-        case, flow, brain, transport, receive_timeout=receive_timeout, emotional=emotional
+        case,
+        flow,
+        brain,
+        transport,
+        receive_timeout=receive_timeout,
+        emotional=emotional,
+        live=live,
     )
 
     async def _run_call():
+        if live is not None:
+            await live.start()
         try:
             return await runner.run()
         finally:
+            if live is not None:
+                await live.stop()
             if engine is not None:
                 await engine.aclose()
 
@@ -154,6 +195,8 @@ def _run(args: argparse.Namespace) -> int:
         call.end_reason,
         transport_error=call.transport_error,
     )
+    if live is not None:
+        live.finish_sync(call.end_reason or "unknown", evaluation.status)
     meta = {
         "persona": {"id": persona.id, "version": persona.version, "variantSeed": seed},
         "journeyFlowId": flow.id,

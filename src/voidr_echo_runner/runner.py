@@ -47,6 +47,7 @@ class CallRunner:
         transport: CallTransport,
         receive_timeout: float = RECEIVE_TIMEOUT_S,
         emotional: Any | None = None,
+        live: Any | None = None,
     ):
         self.case = case
         self.flow = flow
@@ -60,6 +61,9 @@ class CallRunner:
         # EmotionalStateMachine (emotional.py): updated per agent turn; the
         # per-turn state goes to the timeline as the auditable emotional curve.
         self.emotional = emotional
+        # LivePublisher (live_events.py): fire-and-forget tap on the hooks
+        # below — real-time UI feed, never blocks nor fails the call.
+        self.live = live
         self._last_reply_monotonic: float | None = None
 
     def _now_ms(self) -> int:
@@ -67,6 +71,8 @@ class CallRunner:
 
     def _record_event(self, event_type: str, **data: Any) -> None:
         self.result.timeline.append({"ts": self._now_ms(), "type": event_type, **data})
+        if self.live is not None:
+            self.live.on_timeline_event(event_type, data)
 
     def _record_transcript(
         self, speaker: str, text: str, state: str | None = None, source: str | None = None
@@ -82,6 +88,8 @@ class CallRunner:
         if source is not None:
             entry["source"] = source
         self.result.transcript.append(entry)
+        if self.live is not None:
+            self.live.on_transcript(entry)
 
     async def run(self) -> CallResult:
         self.result.started_at_ms = self._now_ms()

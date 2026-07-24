@@ -669,14 +669,46 @@ def serve_execution(out_dir: Path) -> int:
             recorder = StereoCallRecorder()
             transport = AudioTransportAdapter(transport, engine, recorder)
             receive_timeout = 45.0  # remote STT+TTS per turn
+
+        # Live events (plan Feature 1): default ON in serve-execution —
+        # ECHO_LIVE=0 (param or env) opts out; ECHO_LIVE_AUDIO=0 keeps the
+        # semantic events but suppresses turn_audio (real sensitive massas).
+        live = None
+        if (params.get("ECHO_LIVE") or os.environ.get("ECHO_LIVE") or "1") != "0":
+            from .live_events import LivePublisher
+
+            live = LivePublisher(
+                api_url,
+                execution_id,
+                shard_index,
+                token=token,
+                redact=redaction.redact_deny,
+                audio_enabled=(
+                    params.get("ECHO_LIVE_AUDIO") or os.environ.get("ECHO_LIVE_AUDIO") or "1"
+                )
+                != "0",
+            )
+            if mode == "audio":
+                transport.live = live
+
         runner = CallRunner(
-            case, flow, brain, transport, receive_timeout=receive_timeout, emotional=emotional
+            case,
+            flow,
+            brain,
+            transport,
+            receive_timeout=receive_timeout,
+            emotional=emotional,
+            live=live,
         )
 
         async def _run_call():
+            if live is not None:
+                await live.start()
             try:
                 return await runner.run()
             finally:
+                if live is not None:
+                    await live.stop()
                 if engine is not None:
                     await engine.aclose()
 
@@ -689,6 +721,9 @@ def serve_execution(out_dir: Path) -> int:
             transport_error=call.transport_error,
         )
         verdict = classify_session(flow, case.assertion.flow, call)
+        if live is not None:
+            # terminal live event carries the evaluated session status
+            live.finish_sync(call.end_reason or "unknown", verdict.status)
 
         # Everything persisted or POSTed from here on is redacted
         # (artifacts, session transcript/timeline, deviation details).
