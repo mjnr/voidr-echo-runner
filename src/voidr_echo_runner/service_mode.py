@@ -55,6 +55,34 @@ from .transport import build_transport
 
 ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.([A-Za-z0-9_]+)\s*\}\}")
 
+# Prefixes of ENVIRONMENT_PARAMS keys promoted to os.environ before the call
+# pipeline is built. In the cloud the job env carries ONLY the Voidr contract
+# vars (VOIDR_*, EXECUTION_ID, ENVIRONMENT_PARAMS...) — every media/provider
+# secret (Twilio, Deepgram, ElevenLabs) and echo knob travels inside
+# ENVIRONMENT_PARAMS, but the transports/audio engines read os.environ
+# (twilio_transport.REQUIRED_ENV, PipecatAudioEngine, LLMBrain). Promotion
+# bridges the two: params are authoritative (they are the environment's
+# intent for THIS execution), os.environ keeps working as the local-dev
+# fallback when a key is absent from the params bag.
+PROMOTED_ENV_PREFIXES = ("HIVE_", "TWILIO_", "DEEPGRAM_", "ELEVENLABS_", "ECHO_")
+
+
+def promote_params_to_environ(
+    params: dict[str, str], environ: dict[str, str] | None = None
+) -> list[str]:
+    """Promotes media/provider keys from ENVIRONMENT_PARAMS to the process env.
+
+    Returns the promoted key names (values never logged). Empty-string values
+    are skipped — an empty secret must not shadow a locally exported one.
+    """
+    env = os.environ if environ is None else environ
+    promoted: list[str] = []
+    for key, value in params.items():
+        if key.startswith(PROMOTED_ENV_PREFIXES) and value:
+            env[key] = value
+            promoted.append(key)
+    return sorted(promoted)
+
 # Deviation flags — must stay aligned with DEVIATION_FLAGS in
 # voidr-service/src/modules/echo/services/voice-eval.service.ts.
 FLAG_LOOP = "flag:loop"
@@ -605,13 +633,15 @@ def serve_execution(out_dir: Path) -> int:
     shard_total = int(os.environ.get("SHARDS_TOTAL", "1"))
     params: dict[str, str] = json.loads(os.environ.get("ENVIRONMENT_PARAMS", "{}") or "{}")
 
-    # The environment may pin the hive endpoint per execution (dev parity: the
-    # local dispatch spawns the runner with a minimal env, so the repo .env —
-    # loaded by the CLI before this point — would silently win over the
-    # environment's intent). ENVIRONMENT_PARAMS is authoritative job config.
-    for hive_key in ("HIVE_URL", "HIVE_GATEWAY_TOKEN"):
-        if params.get(hive_key):
-            os.environ[hive_key] = params[hive_key]
+    # ENVIRONMENT_PARAMS is authoritative job config: media/provider secrets
+    # (TWILIO_*, DEEPGRAM_*, ELEVENLABS_*), echo knobs (ECHO_*) and the hive
+    # endpoint (HIVE_*) are promoted to os.environ before the pipeline is
+    # built — in the cloud the pod env carries only the Voidr contract vars,
+    # so without promotion the transports/audio engines would see nothing.
+    # os.environ stays as local-dev fallback for keys absent from the bag.
+    promoted = promote_params_to_environ(params)
+    if promoted:
+        print(f"  env params promovidos para o processo: {', '.join(promoted)}")
 
     token = os.environ.get("VOIDR_ACCESS_TOKEN")
     if not token:

@@ -9,6 +9,7 @@ from voidr_echo_runner.service_mode import (
     SessionVerdict,
     build_case,
     build_session_payload,
+    promote_params_to_environ,
     resolve_persona_plan_entry,
 )
 
@@ -151,6 +152,60 @@ def test_persona_plan_absent_or_short_falls_back_to_case_persona():
 def test_persona_plan_malformed_json_never_breaks_the_call(capsys):
     assert resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": "{broken"}, 1) is None
     assert "ECHO_PERSONA_PLAN inválido" in capsys.readouterr().err
+
+
+# ── serve-execution: promoção de secrets ENVIRONMENT_PARAMS → os.environ ─────
+
+
+def test_promote_params_covers_media_hive_and_echo_prefixes():
+    env: dict[str, str] = {}
+    promoted = promote_params_to_environ(
+        {
+            "TWILIO_ACCOUNT_SID": "AC123",
+            "TWILIO_AUTH_TOKEN": "tok",
+            "DEEPGRAM_API_KEY": "dg",
+            "ELEVENLABS_API_KEY": "el",
+            "ECHO_CALL_MODE": "audio",
+            "HIVE_URL": "http://hive:3001",
+            "HIVE_GATEWAY_TOKEN": "gw",
+            "BASE_URL": "https://app.example",  # não promovida (fora dos prefixos)
+            "MOCK_ACCESS_CODE": "919021552",  # idem — resolve só via {{env.*}}
+        },
+        environ=env,
+    )
+    assert promoted == sorted(
+        [
+            "TWILIO_ACCOUNT_SID",
+            "TWILIO_AUTH_TOKEN",
+            "DEEPGRAM_API_KEY",
+            "ELEVENLABS_API_KEY",
+            "ECHO_CALL_MODE",
+            "HIVE_URL",
+            "HIVE_GATEWAY_TOKEN",
+        ]
+    )
+    assert env["TWILIO_ACCOUNT_SID"] == "AC123"
+    assert env["HIVE_GATEWAY_TOKEN"] == "gw"
+    assert "BASE_URL" not in env
+    assert "MOCK_ACCESS_CODE" not in env
+
+
+def test_promote_params_overwrites_local_env_but_keeps_fallback():
+    # ENVIRONMENT_PARAMS é a intenção do environment para ESTA execução —
+    # ganha do os.environ herdado (ex.: .env do repo no dev local)...
+    env = {"HIVE_URL": "http://localhost:3001", "DEEPGRAM_API_KEY": "local"}
+    promote_params_to_environ({"HIVE_URL": "http://hive-prod:3001"}, environ=env)
+    assert env["HIVE_URL"] == "http://hive-prod:3001"
+    # ...mas chave ausente do bag preserva o fallback local (dev sem secret
+    # cadastrado no environment continua funcionando via .env).
+    assert env["DEEPGRAM_API_KEY"] == "local"
+
+
+def test_promote_params_skips_empty_values():
+    env = {"TWILIO_AUTH_TOKEN": "local"}
+    promoted = promote_params_to_environ({"TWILIO_AUTH_TOKEN": ""}, environ=env)
+    assert promoted == []
+    assert env["TWILIO_AUTH_TOKEN"] == "local"
 
 
 def test_session_payload_records_overrides_and_source():
