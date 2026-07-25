@@ -283,3 +283,146 @@ def test_connect_media_roundtrip(twilio_env, monkeypatch):
     assert 4800 <= total <= 7200
 
     assert ("update", {"status": "completed"}) in client.log
+
+
+# --- Media gateway mode (cloud) -------------------------------------------------
+
+
+GATEWAY_TEST_PORT = 8994
+
+
+@pytest.fixture
+def gateway_env(twilio_env, monkeypatch):
+    # No modo gateway o tunnel local não existe — TWILIO_STREAM_PUBLIC_URL fora.
+    monkeypatch.delenv("TWILIO_STREAM_PUBLIC_URL")
+    monkeypatch.setenv("ECHO_MEDIA_GATEWAY_URL", "https://media-gw.example")
+    monkeypatch.setenv(
+        "ECHO_MEDIA_GATEWAY_RUNNER_URL", f"http://127.0.0.1:{GATEWAY_TEST_PORT}"
+    )
+    monkeypatch.setenv("ECHO_MEDIA_GATEWAY_TOKEN", "gw-secret")
+
+
+def test_gateway_mode_builds_capability_urls(gateway_env):
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+    assert transport.gateway_mode
+    assert transport.public_url.startswith("wss://media-gw.example/twilio/")
+    token = transport.public_url.rsplit("/", 1)[1]
+    assert len(token) >= 22  # 128 bits urlsafe
+    assert transport._gateway_runner_url == (
+        f"ws://127.0.0.1:{GATEWAY_TEST_PORT}/runner/{token}"
+    )
+
+
+def test_gateway_mode_does_not_require_stream_public_url(twilio_env, monkeypatch):
+    monkeypatch.delenv("TWILIO_STREAM_PUBLIC_URL")
+    monkeypatch.setenv("ECHO_MEDIA_GATEWAY_URL", "wss://media-gw.example")
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+    # sem ECHO_MEDIA_GATEWAY_RUNNER_URL, o registro usa a mesma base pública
+    assert transport._gateway_runner_url.startswith("wss://media-gw.example/runner/")
+
+
+def test_gateway_mode_full_roundtrip(gateway_env):
+    """Registro outbound com Bearer + start/media/stop chegando pela MESMA
+    conexão persistente (o teste faz o papel do gateway já pareado).
+
+    O `start` precisa chegar ENQUANTO connect() aguarda `_started` — o driver
+    roda como task concorrente, como o Twilio real faria."""
+    client = FakeTwilioClient()
+    transport = TwilioMediaStreamTransport("+5511999999999", client=client)
+    seen: dict = {"path": None, "auth": None, "media": []}
+
+    async def scenario():
+        import websockets
+
+        runner_conn: asyncio.Queue = asyncio.Queue()
+
+        async def gateway_side(ws):
+            seen["path"] = ws.request.path
+            seen["auth"] = ws.request.headers.get("Authorization")
+            await runner_conn.put(ws)
+            async for raw in ws:
+                msg = json.loads(raw)
+                if msg.get("event") == "media":
+                    seen["media"].append(msg)
+
+        async def drive_call():
+            ws = await asyncio.wait_for(runner_conn.get(), 10)
+            await ws.send(json.dumps({"event": "start", "start": {"streamSid": "MZ_gw_1"}}))
+            speech = audioop.lin2ulaw(tone_pcm(TWILIO_SAMPLE_RATE, 600), 2)
+            silence = audioop.lin2ulaw(b"\x00" * int(TWILIO_SAMPLE_RATE * 1.2) * 2, 2)
+            for blob in (speech, silence):
+                for i in range(0, len(blob), 160):
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "event": "media",
+                                "media": {
+                                    "payload": base64.b64encode(blob[i : i + 160]).decode()
+                                },
+                            }
+                        )
+                    )
+            return ws
+
+        async with websockets.serve(gateway_side, "127.0.0.1", GATEWAY_TEST_PORT):
+            driver = asyncio.create_task(drive_call())
+            await transport.connect()
+            ws = await driver
+            msg = await transport.receive(timeout=10.0)
+            assert msg["type"] == "audio"
+            assert msg["sample_rate"] == PIPELINE_SAMPLE_RATE
+
+            await transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 300))
+            await asyncio.sleep(0.3)  # deixa os frames outbound chegarem
+
+            await ws.send(json.dumps({"event": "stop"}))
+            ended = await transport.receive(timeout=10.0)
+            assert ended == {"type": "event", "name": "call_ended", "reason": "completed"}
+            await transport.hangup()
+
+    asyncio.run(scenario())
+
+    token = transport.public_url.rsplit("/", 1)[1]
+    assert seen["path"] == f"/runner/{token}"
+    assert seen["auth"] == "Bearer gw-secret"
+    assert seen["media"], "runner não enviou frames outbound via gateway"
+    assert all(m["streamSid"] == "MZ_gw_1" for m in seen["media"])
+
+    kind, kwargs = client.log[0]
+    assert kind == "create"
+    assert f'<Stream url="wss://media-gw.example/twilio/{token}"/>' in kwargs["twiml"]
+
+
+def test_gateway_disconnect_mid_call_surfaces_call_end(gateway_env):
+    """Gateway caiu no meio da chamada → receive() drena com call_ended em vez
+    de pendurar até o timeout."""
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+
+    async def scenario():
+        import websockets
+
+        runner_conn: asyncio.Queue = asyncio.Queue()
+
+        async def gateway_side(ws):
+            await runner_conn.put(ws)
+            await ws.wait_closed()
+
+        async def drive_call():
+            ws = await asyncio.wait_for(runner_conn.get(), 10)
+            await ws.send(json.dumps({"event": "start", "start": {"streamSid": "MZ_gw_2"}}))
+            return ws
+
+        async with websockets.serve(gateway_side, "127.0.0.1", GATEWAY_TEST_PORT):
+            driver = asyncio.create_task(drive_call())
+            await transport.connect()
+            ws = await driver
+            await ws.close()
+            ended = await transport.receive(timeout=10.0)
+            assert ended == {
+                "type": "event",
+                "name": "call_ended",
+                "reason": "gateway_disconnected",
+            }
+            await transport.hangup()
+
+    asyncio.run(scenario())

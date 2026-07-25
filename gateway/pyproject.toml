@@ -1,0 +1,31 @@
+[project]
+name = "voidr-echo-media-gateway"
+version = "0.1.0"
+description = "Gateway WSS do voidr echo: dá um endpoint público estável ao Twilio Media Streams e faz proxy bidirecional dos frames até o pod do echo-runner (que registra a chamada por conexão outbound)"
+readme = "README.md"
+authors = [
+    { name = "Milson Ramos", email = "milson.ramos@voidr.co" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "websockets>=16.1.1",
+]
+
+[project.scripts]
+echo-media-gateway = "echo_media_gateway.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "echo_media_gateway"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

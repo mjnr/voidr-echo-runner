@@ -29,3 +29,8 @@ build-backend = "uv_build"
 dev = [
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+# gateway/ é um projeto uv próprio (venv separada) — os testes dele rodam com
+# `cd gateway && uv run pytest`, não pela raiz.
+testpaths = ["tests"]

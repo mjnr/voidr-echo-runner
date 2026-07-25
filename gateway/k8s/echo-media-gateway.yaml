@@ -1,0 +1,105 @@
+# voidr echo media gateway — manifests de EXEMPLO (ajuste projeto/domínio).
+#
+# Notas de rollout:
+# - 1 réplica é suficiente para o volume atual (frames ~400B/20ms por
+#   chamada). O pareamento runner↔Twilio é em memória: com réplicas > 1 as
+#   duas pontas do MESMO token precisam cair na MESMA réplica — use nginx
+#   ingress com `nginx.ingress.kubernetes.io/upstream-hash-by: "$request_uri"`
+#   (o token está no path das duas pontas... /runner/{t} e /twilio/{t} têm
+#   paths DIFERENTES; para hash consistente normalize com
+#   upstream-hash-by: "$arg_call" ou um snippet que extraia o último
+#   segmento). Enquanto isso: replicas: 1 + PodDisruptionBudget.
+# - On-demand (sem Spot): o gateway carrega chamadas em curso.
+# - Timeout de backend LONGO: uma chamada dura minutos; o default de 30s do
+#   GCLB mataria o WSS no meio (BackendConfig.timeoutSec).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: echo-media-gateway
+  namespace: voidr-runners
+type: Opaque
+stringData:
+  ECHO_MEDIA_GATEWAY_AUTH_TOKEN: "TROQUE-POR-UM-SECRET-FORTE"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-media-gateway
+  namespace: voidr-runners
+  labels: { app: echo-media-gateway }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: echo-media-gateway }
+  template:
+    metadata:
+      labels: { app: echo-media-gateway }
+    spec:
+      containers:
+        - name: gateway
+          image: southamerica-east1-docker.pkg.dev/PROJETO/REPO/echo-media-gateway:TAG
+          ports: [{ containerPort: 8991 }]
+          envFrom:
+            - secretRef: { name: echo-media-gateway }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8991 }
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8991 }
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+---
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: echo-media-gateway
+  namespace: voidr-runners
+spec:
+  # Chamadas de voz duram minutos — não deixe o GCLB derrubar o WSS.
+  timeoutSec: 3600
+  connectionDraining:
+    drainingTimeoutSec: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-media-gateway
+  namespace: voidr-runners
+  annotations:
+    cloud.google.com/backend-config: '{"default": "echo-media-gateway"}'
+spec:
+  selector: { app: echo-media-gateway }
+  ports:
+    - port: 8991
+      targetPort: 8991
+---
+# TLS: ManagedCertificate (GKE) ou cert-manager. O Twilio exige wss:// com
+# certificado válido.
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: echo-media-gateway
+  namespace: voidr-runners
+spec:
+  domains: [media-gw.voidr.co]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: echo-media-gateway
+  namespace: voidr-runners
+  annotations:
+    networking.gke.io/managed-certificates: echo-media-gateway
+    kubernetes.io/ingress.allow-http: "false"
+spec:
+  rules:
+    - host: media-gw.voidr.co
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-media-gateway
+                port: { number: 8991 }

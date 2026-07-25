@@ -5,6 +5,11 @@ Call flow:
      pointing at this runner's local Media Streams WebSocket server (exposed via
      ngrok/cloudflared — see README). `send_digits` (with `w` pauses) handles
      IVR navigation at answer time; dual-channel recording is enabled.
+     CLOUD: with ECHO_MEDIA_GATEWAY_URL set, no local server/tunnel exists —
+     the runner dials OUT to the stable media gateway (/runner/{call-token},
+     Bearer ECHO_MEDIA_GATEWAY_TOKEN) and the TwiML points at the gateway's
+     public /twilio/{call-token}; the gateway pairs both sockets and proxies
+     the frames (see gateway/README.md).
   2. Twilio connects to the WebSocket and streams inbound audio (8 kHz mu-law).
      Pipecat's `TwilioFrameSerializer` decodes to PCM 16 kHz; an energy-based
      segmenter groups it into complete utterances, delivered as the same
@@ -30,6 +35,7 @@ import audioop
 import base64
 import json
 import os
+import secrets
 import time
 from typing import Any
 
@@ -145,14 +151,40 @@ class TwilioMediaStreamTransport:
         self.to_number = to_number
         self.from_number = os.environ["TWILIO_FROM_NUMBER"]
         self.account_sid = os.environ["TWILIO_ACCOUNT_SID"]
-        self.public_url = public_url or os.environ.get("TWILIO_STREAM_PUBLIC_URL", "")
-        if not self.public_url:
-            raise RuntimeError(
-                "TwilioTransport requires TWILIO_STREAM_PUBLIC_URL (public wss:// "
-                "endpoint of the Media Streams server — start ngrok/cloudflared "
-                "against the runner port first, see README)."
+        # Cloud mode: ECHO_MEDIA_GATEWAY_URL flips the media plumbing from
+        # "local WS server + per-machine tunnel" to "outbound registration on
+        # the stable public media gateway" (see gateway/README.md). The runner
+        # mints an unguessable per-call token, dials OUT to /runner/{token}
+        # (Bearer ECHO_MEDIA_GATEWAY_TOKEN) and points the TwiML at the
+        # gateway's public /twilio/{token} — no inbound connectivity to the
+        # pod is ever needed.
+        gateway_url = (os.environ.get("ECHO_MEDIA_GATEWAY_URL") or "").rstrip("/")
+        self.gateway_mode = bool(gateway_url)
+        self._gateway_ws = None
+        self._gateway_task: asyncio.Task | None = None
+        if self.gateway_mode:
+            call_token = secrets.token_urlsafe(16)  # 128 bits
+            public_base = gateway_url.replace("https://", "wss://").replace(
+                "http://", "ws://"
             )
-        self.public_url = self.public_url.replace("https://", "wss://")
+            runner_base = (
+                (os.environ.get("ECHO_MEDIA_GATEWAY_RUNNER_URL") or gateway_url)
+                .rstrip("/")
+                .replace("https://", "wss://")
+                .replace("http://", "ws://")
+            )
+            self.public_url = f"{public_base}/twilio/{call_token}"
+            self._gateway_runner_url = f"{runner_base}/runner/{call_token}"
+        else:
+            self.public_url = public_url or os.environ.get("TWILIO_STREAM_PUBLIC_URL", "")
+            if not self.public_url:
+                raise RuntimeError(
+                    "TwilioTransport requires TWILIO_STREAM_PUBLIC_URL (public wss:// "
+                    "endpoint of the Media Streams server — start ngrok/cloudflared "
+                    "against the runner port first, see README) or "
+                    "ECHO_MEDIA_GATEWAY_URL (media gateway mode, see gateway/README.md)."
+                )
+            self.public_url = self.public_url.replace("https://", "wss://")
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.send_digits = send_digits
@@ -184,9 +216,23 @@ class TwilioMediaStreamTransport:
     async def connect(self) -> None:
         import websockets
 
-        self._server = await websockets.serve(
-            self._handle_media_ws, self.listen_host, self.listen_port
-        )
+        if self.gateway_mode:
+            # Register the call on the media gateway BEFORE dialing: the
+            # pairing must exist when Twilio's Media Stream connects.
+            headers = {}
+            gw_token = os.environ.get("ECHO_MEDIA_GATEWAY_TOKEN")
+            if gw_token:
+                headers["Authorization"] = f"Bearer {gw_token}"
+            self._gateway_ws = await websockets.connect(
+                self._gateway_runner_url, additional_headers=headers
+            )
+            self._gateway_task = asyncio.create_task(
+                self._run_gateway_session(self._gateway_ws)
+            )
+        else:
+            self._server = await websockets.serve(
+                self._handle_media_ws, self.listen_host, self.listen_port
+            )
         twiml = (
             "<Response><Connect>"
             f'<Stream url="{self.public_url}"/>'
@@ -208,10 +254,16 @@ class TwilioMediaStreamTransport:
             await asyncio.wait_for(self._started.wait(), timeout=STREAM_START_TIMEOUT_S)
         except (TimeoutError, asyncio.TimeoutError):
             await self.hangup()
+            hint = (
+                f"check that the media gateway at {self.public_url} is publicly "
+                "reachable by Twilio"
+                if self.gateway_mode
+                else f"check that {self.public_url} tunnels to "
+                f"{self.listen_host}:{self.listen_port}"
+            )
             raise RuntimeError(
                 f"Twilio call {self.call_sid} created but the Media Stream never "
-                f"connected within {STREAM_START_TIMEOUT_S:.0f}s — check that "
-                f"{self.public_url} tunnels to {self.listen_host}:{self.listen_port}"
+                f"connected within {STREAM_START_TIMEOUT_S:.0f}s — {hint}"
             ) from None
 
     async def hangup(self) -> None:
@@ -229,57 +281,98 @@ class TwilioMediaStreamTransport:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        if self._gateway_task is not None:
+            self._gateway_task.cancel()
+            self._gateway_task = None
+        if self._gateway_ws is not None:
+            try:
+                await self._gateway_ws.close()
+            except Exception:  # noqa: BLE001 — gateway conn may already be gone
+                pass
+            self._gateway_ws = None
 
     # -- media stream server -------------------------------------------------
 
     async def _handle_media_ws(self, ws) -> None:
+        """Local-server mode: one handler invocation per inbound connection
+        (tunnel). A DTMF reconnect arrives as a NEW connection, so 'reconnect'
+        also exits this handler — the server keeps listening."""
+        async for raw in ws:
+            outcome = await self._process_media_event(raw, ws)
+            if outcome in ("reconnect", "ended"):
+                break
+
+    async def _run_gateway_session(self, ws) -> None:
+        """Gateway mode: ONE persistent outbound connection carries the whole
+        call — on a DTMF reconnect the Twilio side re-attaches at the gateway
+        and the next `start` event arrives on this same socket, so 'reconnect'
+        keeps consuming instead of exiting."""
+        import websockets
+
+        try:
+            async for raw in ws:
+                outcome = await self._process_media_event(raw, ws)
+                if outcome == "ended":
+                    break
+        except websockets.ConnectionClosed:
+            pass
+        if not self._closed and not self._ended:
+            # Gateway (or the pairing) died mid-call — surface it as a call
+            # end so receive() drains instead of hanging until timeout.
+            self._ended = True
+            self._inbox.put_nowait(
+                {"type": "event", "name": "call_ended", "reason": "gateway_disconnected"}
+            )
+
+    async def _process_media_event(self, raw, ws) -> str:
+        """Handles one Media Streams frame. Returns 'ok' | 'reconnect' | 'ended'."""
         from pipecat.frames.frames import InputAudioRawFrame, StartFrame
         from pipecat.serializers.twilio import TwilioFrameSerializer
 
-        async for raw in ws:
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            kind = event.get("event")
-            if kind == "start":
-                self.stream_sid = event["start"]["streamSid"]
-                self._serializer = TwilioFrameSerializer(
-                    stream_sid=self.stream_sid,
-                    params=TwilioFrameSerializer.InputParams(
-                        twilio_sample_rate=TWILIO_SAMPLE_RATE,
-                        sample_rate=PIPELINE_SAMPLE_RATE,
-                        # hangup is handled by this transport via the REST API
-                        auto_hang_up=False,
-                    ),
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            return "ok"
+        kind = event.get("event")
+        if kind == "start":
+            self.stream_sid = event["start"]["streamSid"]
+            self._serializer = TwilioFrameSerializer(
+                stream_sid=self.stream_sid,
+                params=TwilioFrameSerializer.InputParams(
+                    twilio_sample_rate=TWILIO_SAMPLE_RATE,
+                    sample_rate=PIPELINE_SAMPLE_RATE,
+                    # hangup is handled by this transport via the REST API
+                    auto_hang_up=False,
+                ),
+            )
+            await self._serializer.setup(
+                StartFrame(
+                    audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
+                    audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
                 )
-                await self._serializer.setup(
-                    StartFrame(
-                        audio_in_sample_rate=PIPELINE_SAMPLE_RATE,
-                        audio_out_sample_rate=PIPELINE_SAMPLE_RATE,
-                    )
-                )
-                self._ws = ws
-                self._started.set()
-            elif kind == "media" and self._serializer is not None:
-                frame = await self._serializer.deserialize(raw)
-                if isinstance(frame, InputAudioRawFrame):
-                    for utterance in self._segmenter.feed(frame.audio):
-                        self._push_utterance(utterance)
-            elif kind == "stop":
-                tail = self._segmenter.flush()
-                if tail:
-                    self._push_utterance(tail)
-                if self._expect_reconnect:
-                    # Old stream closing after a DTMF TwiML update; a new
-                    # <Connect><Stream> connection is on its way.
-                    self._expect_reconnect = False
-                    break
-                self._ended = True
-                self._inbox.put_nowait(
-                    {"type": "event", "name": "call_ended", "reason": "completed"}
-                )
-                break
+            )
+            self._ws = ws
+            self._started.set()
+        elif kind == "media" and self._serializer is not None:
+            frame = await self._serializer.deserialize(raw)
+            if isinstance(frame, InputAudioRawFrame):
+                for utterance in self._segmenter.feed(frame.audio):
+                    self._push_utterance(utterance)
+        elif kind == "stop":
+            tail = self._segmenter.flush()
+            if tail:
+                self._push_utterance(tail)
+            if self._expect_reconnect:
+                # Old stream closing after a DTMF TwiML update; a new
+                # <Connect><Stream> connection is on its way.
+                self._expect_reconnect = False
+                return "reconnect"
+            self._ended = True
+            self._inbox.put_nowait(
+                {"type": "event", "name": "call_ended", "reason": "completed"}
+            )
+            return "ended"
+        return "ok"
 
     def _push_utterance(self, pcm: bytes) -> None:
         self._inbox.put_nowait(
@@ -366,7 +459,7 @@ class TwilioMediaStreamTransport:
         self._expect_reconnect = True
         self._started.clear()
         await asyncio.to_thread(self.client.calls(self.call_sid).update, twiml=twiml)
-        if self._server is not None:
+        if self._server is not None or self._gateway_ws is not None:
             try:
                 await asyncio.wait_for(self._started.wait(), timeout=30.0)
             except (TimeoutError, asyncio.TimeoutError):
