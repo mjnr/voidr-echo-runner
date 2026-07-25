@@ -1,0 +1,59 @@
+{
+  "id": "segunda-via-fatura-v1",
+  "source": "vivo-autopilot-mock/journeys/segunda-via-fatura.yaml",
+  "states": {
+    "saudacao": {
+      "expects": ["apresentação do agente"],
+      "next": ["pedido_cpf"],
+      "keywords": ["assistente virtual", "como posso te ajudar"]
+    },
+    "pedido_cpf": {
+      "expects": ["pedido do CPF do titular para localizar o cadastro"],
+      "next": ["confirmacao_nascimento"],
+      "max_turns": 4,
+      "keywords": ["cpf do titular", "numero do cpf", "me ditar o numero do cpf"]
+    },
+    "confirmacao_nascimento": {
+      "expects": ["confirmação da data de nascimento por segurança"],
+      "next": ["info_fatura"],
+      "max_turns": 4,
+      "keywords": ["data de nascimento"]
+    },
+    "info_fatura": {
+      "expects": ["informe da fatura em aberto (valor e vencimento) e opções de segunda via"],
+      "next": ["envio_sms", "codigo_barras", "encerramento"],
+      "keywords": ["fatura em aberto", "vencimento no dia dez", "segunda via por sms"]
+    },
+    "envio_sms": {
+      "expects": ["confirmação verbal do envio da segunda via por SMS"],
+      "terminal": true,
+      "evidence": ["second_copy_sent"],
+      "keywords": ["acabei de enviar a segunda via", "confirmado o envio"]
+    },
+    "codigo_barras": {
+      "expects": ["ditado do código de barras da fatura"],
+      "terminal": true,
+      "evidence": ["barcode_dictated"],
+      "keywords": ["anota ai o codigo de barras", "codigo de barras da fatura"]
+    },
+    "encerramento": {
+      "terminal": true,
+      "classification": "encerrado",
+      "keywords": ["qualquer coisa e so me chamar", "sem problemas"]
+    },
+    "transferencia_humano": {
+      "terminal": true,
+      "classification": "escalacao",
+      "keywords": ["transferir", "atendentes"]
+    },
+    "jornada_errada": {
+      "terminal": true,
+      "classification": "desvio_critico",
+      "keywords": ["saldo atual", "bloqueio por debito", "desbloqueio", "link do app pra recarga"]
+    }
+  },
+  "deviation_rules": [
+    { "if": "estado atual sem transição válida por 2 turnos", "then": "flag:loop" },
+    { "if": "agente encerra sem estado terminal esperado", "then": "flag:abandono" }
+  ]
+}

@@ -1,0 +1,36 @@
+# Caso EXEC-REALISM: segunda via de fatura com coleta de CPF + nascimento.
+# Exercita a imperfeição de memória (a persona "não lembra" o CPF na hora,
+# hesita, busca o documento e dita) e o vocabulário do glossário (Dona
+# Márcia fala "a conta", nunca "fatura"). Massa pessoal SINTÉTICA via
+# ECHO_MASSA (dígitos verificadores válidos por algoritmo — não é documento
+# real) ou fallback para identity.facts.
+id: segunda-via-fatura-tc-004
+channel: voice
+persona:
+  base: dona-marcia-58-mineira
+  variant_seed: 7
+  overrides: {}
+massa:
+  ani: "11900000001"
+  profile: MASSA_ANI_SALDO
+dial_plan:
+  dtmf_steps:
+    - wait_for_prompt_matching: "codigo de acesso"
+      send: "{{env.MOCK_ACCESS_CODE}}"
+    - wait_for_prompt_matching: "digite o numero"
+      send: "11900000001#"
+journey_flow: ../flows/segunda-via-fatura-v1.json
+module_slug: jornada-segunda-via-de-fatura
+goal: "a conta da Vivo venceu e você perdeu o papel — quer a segunda via pra pagar"
+arrange: >
+  Linha pós-paga fake com fatura em aberto fictícia. Persona de baixo
+  letramento, não lembra o CPF de cabeça (precisa buscar o documento).
+act: >
+  Conduzir a conversa até o agente: (1) pedir e receber o CPF do titular,
+  (2) confirmar a data de nascimento, (3) informar a fatura em aberto e
+  (4) confirmar o envio da segunda via (SMS ou código de barras).
+assert:
+  flow:
+    must_visit: [saudacao, pedido_cpf, confirmacao_nascimento, info_fatura]
+    must_not_visit: [transferencia_humano, jornada_errada]
+    max_turns: 16

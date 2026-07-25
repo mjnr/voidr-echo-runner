@@ -310,6 +310,7 @@ def test_empty_glossary_vocabulary_is_omitted(hive_env, persona):
 
     enriched = persona.model_copy(deep=True)
     enriched.glossaryVocabulary = GlossaryVocabulary(masteryRate=0.9, band="alto")
+    enriched.literacy = None  # o catálogo agora traz literacy — o teste é da OMISSÃO
 
     brain = LLMBrain(enriched, goal="saldo", seed=1, client=_client(handler))
     brain.reply("Bom dia!")

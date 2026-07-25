@@ -71,6 +71,23 @@ personas:
       speakingRate: 0.95
       backgroundNoise: tv_sala
       disfluencyRate: 0.3
+    # v2.1 (E3/EXEC-REALISM): eixo de letramento + vocabulário de glossário
+    # local (em produção o service resolve a partição do glossário da org;
+    # este é o equivalente offline para execuções locais/smoke).
+    literacy:
+      inafLevel: rudimentar
+      digitalFluency: baixa
+      numeracy: baixa
+    glossaryVocabulary:
+      masteryRate: 0.3
+      band: baixo
+      popularOnly:
+        - { term: fatura, synonym: a conta }
+        - { term: segunda via, synonym: outra conta pra pagar }
+        - { term: recarga, synonym: colocar credito }
+      unknown:
+        - { term: titularidade }
+        - { term: deep link }
     goalTemplate: "Oi, moço... então, {goal}, sabe? Fiquei até preocupada."
     vocabulary: [uai, trem, "ocê"]
     massaProfile: MASSA_ANI_SALDO
