@@ -17,7 +17,7 @@ import random
 from typing import Any, Protocol
 
 from .models import Persona
-from .textutil import keyword_matches
+from .textutil import keyword_matches, to_first_person
 
 
 class PersonaBrain(Protocol):
@@ -60,10 +60,21 @@ _RESPONSES: dict[str, str] = {
 class ScriptedBrain:
     """Deterministic v0 brain. Same persona + same seed => same utterances."""
 
+    # Framings used when the agent asks the goal AGAIN ("não entendi, pode
+    # me contar de novo?"): a real person REPHRASES instead of repeating the
+    # same sentence verbatim (bug real: persona repetia o goalTemplate
+    # literalmente quando a URA pedia para repetir). Deterministic per seed.
+    _RESTATE_FRAMINGS = (
+        "Então, deixa eu falar de novo, mais devagar: {goal}",
+        "Tá, vou explicar de outro jeito: {goal}",
+        "Como eu falei: {goal}",
+    )
+
     def __init__(self, persona: Persona, goal: str, seed: int):
         self.persona = persona
         self.goal = goal
         self.rng = random.Random(seed)
+        self._goal_statements = 0
 
     def reply(self, agent_utterance: str) -> str:
         intent = "ack"
@@ -72,7 +83,16 @@ class ScriptedBrain:
                 intent = rule_intent
                 break
         if intent == "state_goal":
-            base = self.persona.goalTemplate.format(goal=self.goal)
+            # goalTemplate/goal são autorados e chegam MUITAS vezes em 3ª
+            # pessoa ("Ele quer falar sobre a conta...") — a persona fala em
+            # 1ª pessoa, sempre.
+            base = to_first_person(self.persona.goalTemplate.format(goal=self.goal))
+            if self._goal_statements > 0:
+                framing = self._RESTATE_FRAMINGS[
+                    (self._goal_statements - 1) % len(self._RESTATE_FRAMINGS)
+                ]
+                base = framing.format(goal=base[0].lower() + base[1:] if base else base)
+            self._goal_statements += 1
         else:
             base = _RESPONSES[intent]
         return self._stylize(base)
