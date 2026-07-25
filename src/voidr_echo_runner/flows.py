@@ -29,6 +29,10 @@ class JourneyFlow:
     source: str | None
     states: dict[str, FlowState]
     deviation_rules: list[dict]
+    # Journey-level DTMF preamble (service flow.dialPlan.dtmfSteps, raw dicts
+    # with waitFor/send). Precedence in build_case: case dtmfSteps → these →
+    # environment dialPlanDefaults. Sends may carry {{massa.*}}/{{env.*}}.
+    dial_plan_steps: list[dict] = field(default_factory=list)
 
     def terminal_states(self) -> set[str]:
         return {name for name, s in self.states.items() if s.terminal}

@@ -40,6 +40,7 @@ from .artifacts import write_artifacts
 from .brain import build_brain
 from .evaluator import EvaluationResult, evaluate_trajectory
 from .flows import FlowState, JourneyFlow
+from .humanize import MassaFacts
 from .models import (
     CaseAssert,
     DialPlan,
@@ -245,6 +246,7 @@ def flow_from_service(doc: dict) -> JourneyFlow:
         source=doc.get("source"),
         states=states,
         deviation_rules=rules,
+        dial_plan_steps=list((doc.get("dialPlan") or {}).get("dtmfSteps") or []),
     )
 
 
@@ -298,6 +300,28 @@ def find_case(plan: dict, target: dict) -> dict:
     )
 
 
+def _resolve_dtmf_send(
+    value: str,
+    massa: "MassaFacts | None",
+    params: dict[str, str],
+    captured: dict[str, str],
+) -> str:
+    """Two-pass placeholder resolution for a DTMF send: {{massa.X}} from the
+    ECHO_MASSA bag first (a massa value may itself be an {{env.Y}} secret
+    reference), then {{env.Y}} from ENVIRONMENT_PARAMS. Unresolved massa keys
+    fail LOUD — dialing a literal placeholder as digits is never right."""
+    if massa is not None:
+        value, _ = massa.resolve_placeholders(value)
+    value = resolve_params_placeholders(value, params, captured)
+    if "{{massa." in value:
+        available = ", ".join(sorted(massa.values)) if massa else "(no ECHO_MASSA)"
+        raise ServeExecutionError(
+            f"dial-plan send {value!r} references massa keys missing from "
+            f"ECHO_MASSA (available: {available}) — fix the journey massa or the dial plan"
+        )
+    return value
+
+
 def build_case(
     target: dict,
     case_doc: dict,
@@ -305,6 +329,7 @@ def build_case(
     flow: JourneyFlow,
     params: dict[str, str],
     plan_id: str | None = None,
+    massa: "MassaFacts | None" = None,
 ) -> tuple[VoiceTestCase, str]:
     """Builds the runner-side VoiceTestCase + the resolved call target URL."""
     voice = case_doc.get("voice") or {}
@@ -322,12 +347,17 @@ def build_case(
         )
     call_target = resolve_params_placeholders(str(raw_target), params, captured)
 
+    # DTMF preamble precedence: case dtmfSteps → journey (flow.dialPlan,
+    # editable in the journey editor) → environment dialPlanDefaults.
+    steps_source = list(dial_plan_doc.get("dtmfSteps") or [])
+    if not steps_source and flow.dial_plan_steps:
+        steps_source = flow.dial_plan_steps
     steps = [
         DtmfStep(
             wait_for_prompt_matching=step.get("waitFor"),
-            send=resolve_params_placeholders(str(step["send"]), params, captured),
+            send=_resolve_dtmf_send(str(step["send"]), massa, params, captured),
         )
-        for step in dial_plan_doc.get("dtmfSteps", [])
+        for step in steps_source
     ]
     if not steps:
         # Environment dial-plan defaults (IVR access code + ANI) for cases
@@ -717,15 +747,18 @@ def serve_execution(out_dir: Path) -> int:
         # config stores the ObjectId, so report the resolved slug instead.
         voice_config = {**voice_config, "personaId": persona.id}
 
-        case, call_target = build_case(target, case_doc, persona.id, flow, params, plan_id)
-        seed = voice_config.get("seed") or 0
         # EXEC-REALISM: personal massa of this call — ECHO_MASSA (JSON in
         # ENVIRONMENT_PARAMS, managed service-side) with fallback to the
-        # persona's own identity facts. Values feed the PII deny-list via
-        # case.massa BEFORE the redaction session is built.
-        from .humanize import Humanizer, MassaFacts
+        # persona's own identity facts. Resolved BEFORE build_case: the dial
+        # plan's {{massa.*}} sends need the bag; values feed the PII deny-list
+        # via case.massa BEFORE the redaction session is built.
+        from .humanize import Humanizer
 
         massa = MassaFacts.resolve(params, persona)
+        case, call_target = build_case(
+            target, case_doc, persona.id, flow, params, plan_id, massa=massa
+        )
+        seed = voice_config.get("seed") or 0
         if massa:
             case.massa = dict(massa.values)
         # PII redaction (ARCHITECTURE.md section 10) — ALWAYS on in service

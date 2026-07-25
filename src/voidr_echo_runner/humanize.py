@@ -42,6 +42,11 @@ from .textutil import normalize
 # (the hive PII guard must never see the real value).
 MASSA_PLACEHOLDER = re.compile(r"\{\{\s*(?:massa|env)\.([A-Za-z0-9_]+)\s*\}\}")
 
+# {{env.X}} inside a massa VALUE: journey massa fields may point at an
+# environment secret (massa editor pattern) — resolved against
+# ENVIRONMENT_PARAMS when the bag is loaded.
+_ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.([A-Za-z0-9_]+)\s*\}\}")
+
 # Canonical massa keys and how they map to the agent's data-request
 # categories (emotional._DATA_CATEGORIES keys) + spoken labels.
 MASSA_FIELDS: dict[str, dict[str, str]] = {
@@ -151,11 +156,29 @@ class MassaFacts:
             return None
         values: dict[str, str] = {}
         for key, value in data.items():
-            canonical = _canonical_key(str(key)) or (key if key in MASSA_FIELDS else None)
-            # "{{" guard: an unresolved {{env.X}} placeholder is not a value —
-            # speaking it literally would be worse than having no massa.
-            if canonical and value is not None and str(value).strip() and "{{" not in str(value):
-                values[canonical] = str(value).strip()
+            if value is None:
+                continue
+            text = str(value).strip()
+            # Massa fields may reference environment secrets ({{env.X}}) —
+            # resolve them against ENVIRONMENT_PARAMS here so both the dial
+            # plan and the speech substitution consume the real value.
+            if "{{" in text:
+                text = _ENV_PLACEHOLDER.sub(
+                    lambda m: params.get(m.group(1), m.group(0)), text
+                ).strip()
+            # "{{" guard: a STILL-unresolved placeholder is not a value —
+            # speaking/dialing it literally is worse than having no massa.
+            if not text or "{{" in text:
+                continue
+            canonical = _canonical_key(str(key)) or (
+                str(key) if str(key) in MASSA_FIELDS else None
+            )
+            if canonical:
+                values.setdefault(canonical, text)
+            # The journey's OWN key is preserved too: dial plans and steps
+            # reference {{massa.<key>}} with journey key names (e.g.
+            # telefone_ura), not only the canonical personal-data card keys.
+            values.setdefault(str(key), text)
         return cls(values=values, source="environment") if values else None
 
     @classmethod

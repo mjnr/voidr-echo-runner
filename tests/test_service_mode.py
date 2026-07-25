@@ -127,6 +127,90 @@ def test_case_dtmf_steps_win_over_env_defaults():
     assert [s.send for s in case.dial_plan.dtmf_steps] == ["111111"]
 
 
+# ── pré-âmbulo DTMF da jornada (flow.dialPlan) + {{massa.*}} nos sends ────────
+
+
+def _flow_with_dial_plan() -> JourneyFlow:
+    return JourneyFlow(
+        id="jornada-info-de-planos",
+        source=None,
+        states={"saudacao": FlowState(name="saudacao", expects=[], next=[], terminal=True)},
+        deviation_rules=[],
+        dial_plan_steps=[
+            {"waitFor": "código de acesso", "send": "{{massa.codigo_acesso}}"},
+            {"waitFor": "número da linha", "send": "{{massa.telefone_ura}}#"},
+        ],
+    )
+
+
+def _massa(values: dict[str, str]) -> "MassaFacts":
+    from voidr_echo_runner.humanize import MassaFacts
+
+    return MassaFacts(values=values, source="environment")
+
+
+def test_flow_dial_plan_fills_case_without_dtmf_steps_resolving_massa():
+    massa = _massa({"codigo_acesso": "919021050", "telefone_ura": "11900000001"})
+    case, _ = build_case(_target(), _case_doc(), "p", _flow_with_dial_plan(), {}, massa=massa)
+    assert [s.send for s in case.dial_plan.dtmf_steps] == ["919021050", "11900000001#"]
+    assert [s.wait_for_prompt_matching for s in case.dial_plan.dtmf_steps] == [
+        "código de acesso",
+        "número da linha",
+    ]
+
+
+def test_massa_value_may_reference_env_secret():
+    # Editor de massa: campo fixo apontando para um secret do environment —
+    # duas passadas: {{massa.X}} → {{env.Y}} → valor real.
+    massa = _massa({"codigo_acesso": "{{env.IBM_ACCESS_CODE}}", "telefone_ura": "11900000001"})
+    params = {"IBM_ACCESS_CODE": "123456"}
+    case, _ = build_case(_target(), _case_doc(), "p", _flow_with_dial_plan(), params, massa=massa)
+    assert case.dial_plan.dtmf_steps[0].send == "123456"
+
+
+def test_case_dtmf_steps_win_over_flow_dial_plan():
+    doc = _case_doc()
+    doc["voice"]["dialPlan"]["dtmfSteps"] = [{"waitFor": "código", "send": "111111"}]
+    massa = _massa({"codigo_acesso": "919021050", "telefone_ura": "11900000001"})
+    case, _ = build_case(_target(), doc, "p", _flow_with_dial_plan(), {}, massa=massa)
+    assert [s.send for s in case.dial_plan.dtmf_steps] == ["111111"]
+
+
+def test_echo_massa_from_params_resolves_env_refs_and_keeps_journey_keys():
+    import json
+
+    from voidr_echo_runner.humanize import MassaFacts
+
+    params = {
+        "ECHO_MASSA": json.dumps(
+            {
+                "codigo_acesso": "{{env.IBM_ACCESS_CODE}}",
+                "telefone_ura": "11900000001",
+                "quebrado": "{{env.NAO_EXISTE}}",
+            }
+        ),
+        "IBM_ACCESS_CODE": "919021050",
+    }
+    massa = MassaFacts.from_params(params)
+    assert massa is not None
+    # Chave da jornada preservada + alias canônico do card pessoal.
+    assert massa.values["codigo_acesso"] == "919021050"
+    assert massa.values["accessCode"] == "919021050"
+    assert massa.values["telefone_ura"] == "11900000001"
+    # Placeholder irresolúvel continua fora do bag (guard de fala/discagem).
+    assert "quebrado" not in massa.values
+
+
+def test_unresolved_massa_placeholder_fails_loud():
+    import pytest
+
+    from voidr_echo_runner.service_mode import ServeExecutionError
+
+    massa = _massa({"telefone_ura": "11900000001"})  # sem codigo_acesso
+    with pytest.raises(ServeExecutionError, match="codigo_acesso"):
+        build_case(_target(), _case_doc(), "p", _flow_with_dial_plan(), {}, massa=massa)
+
+
 # ── ECHO_PERSONA_PLAN: persona/overrides por shard (multi-persona) ───────────
 
 

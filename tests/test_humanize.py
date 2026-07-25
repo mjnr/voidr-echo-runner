@@ -41,7 +41,14 @@ def test_massa_accepts_portuguese_aliases():
         {"ECHO_MASSA": '{"data_nascimento": "12/03/1966", "nome": "Márcia F."}'}
     )
     assert massa is not None
-    assert massa.values == {"birthDate": "12/03/1966", "fullName": "Márcia F."}
+    # Aliases canônicos (card pessoal) + chaves originais preservadas (dial
+    # plan/steps referenciam {{massa.<chave da jornada>}}).
+    assert massa.values == {
+        "birthDate": "12/03/1966",
+        "fullName": "Márcia F.",
+        "data_nascimento": "12/03/1966",
+        "nome": "Márcia F.",
+    }
 
 
 @pytest.mark.parametrize("raw", ["", "not-json", "[1,2]", '{"cpf": ""}', '{"cpf": "{{env.X}}"}'])
