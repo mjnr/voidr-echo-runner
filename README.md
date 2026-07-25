@@ -425,3 +425,69 @@ O voidr-service com `ECHO_LOCAL_RUNNER_SCRIPT=<path>/scripts/serve-execution.sh`
 esse wrapper localmente com o env acima — logs em `out/serve-logs/`. Em
 produção o dispatch é um job GKE com a imagem `GKE_ECHO_RUNNER_IMAGE`, mesmo
 contrato de env.
+
+Para provar a **paridade cloud** no dev local, use
+`scripts/serve-execution-docker.sh` como `ECHO_LOCAL_RUNNER_SCRIPT`: mesmo
+contrato, mas o shard roda dentro da imagem Docker (`voidr-echo-runner:dev`),
+com `localhost`/`127.0.0.1` reescritos para `host.docker.internal` (service,
+hive e mock ficam no host). Logs em `out/serve-logs/*-docker.log`.
+
+## Execução em nuvem
+
+Como o mesmo `serve-execution` roda num pod GKE. Componentes:
+
+- **Imagem** — `Dockerfile` na raiz (multi-stage com `uv`, runtime
+  `python:3.13-slim`, usuário não-root, `ENTRYPOINT ["echo-runner",
+  "serve-execution"]`). O GKE Job não seta `command`, então o ENTRYPOINT é o
+  contrato. Build/push:
+
+  ```bash
+  docker build -t $REGISTRY/voidr-echo-runner:$TAG .
+  docker push $REGISTRY/voidr-echo-runner:$TAG
+  ```
+
+- **Dispatch no service** — VOICE cai no cloud dispatch genérico (GKE Job).
+  A imagem vem de `jobRunnerConfig.gkeRunnerImage` do environment ou do config
+  `GKE_ECHO_RUNNER_IMAGE` do service; **sem imagem configurada o dispatch
+  VOICE falha com erro claro** (nunca cai na imagem Playwright). Jobs VOICE
+  vão para node pool **on-demand** (não Spot) — preempção derrubaria chamadas
+  em curso.
+- **Secrets** — chegam em `ENVIRONMENT_PARAMS` (JSON) e o runner promove para
+  `os.environ` as chaves `TWILIO_*`, `DEEPGRAM_*`, `ELEVENLABS_*`, `ECHO_*` e
+  `HIVE_*` antes de montar o pipeline (`service_mode.py`;
+  valores de `ENVIRONMENT_PARAMS` vencem o env do processo). `HIVE_URL`/
+  `HIVE_GATEWAY_TOKEN` são injetados pelo service no dispatch quando o
+  environment não os define (brain LLM funciona na nuvem sem `.env`).
+- **Twilio (modo áudio PSTN)** — pod não tem WSS público; use o
+  **media gateway** (`gateway/`): Deployment estável com endpoint WSS público,
+  runner registra outbound (`ECHO_MEDIA_GATEWAY_URL` +
+  `ECHO_MEDIA_GATEWAY_TOKEN` nos `ENVIRONMENT_PARAMS`) e o gateway faz proxy
+  bidirecional dos frames por token de chamada. Desenho, manifests K8s e prova
+  local no `gateway/README.md`.
+
+### Checklist de rollout
+
+1. Build + push da imagem do runner para o registry do cluster.
+2. `GKE_ECHO_RUNNER_IMAGE=<registry>/voidr-echo-runner:<tag>` no config do
+   service (ou `jobRunnerConfig.gkeRunnerImage` por environment).
+3. `HIVE_URL`/`HIVE_GATEWAY_TOKEN` no config do service (fallback para o
+   brain LLM) — ou por environment nos secrets.
+4. Secrets de mídia (`TWILIO_*`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`) nos
+   environment secrets da aplicação (viram `ENVIRONMENT_PARAMS`).
+5. Node pool on-demand disponível (o dispatch VOICE já pede on-demand).
+6. Para PSTN: deploy do `echo-media-gateway` (Deployment + Service + Ingress
+   WSS, `gateway/k8s/`), e `ECHO_MEDIA_GATEWAY_URL`/`ECHO_MEDIA_GATEWAY_TOKEN`
+   nos environment secrets.
+7. Targets `ws://localhost` (mock) não são alcançáveis de pod — environments
+   de nuvem precisam de target público ou `tel:`.
+
+### Pendências conhecidas
+
+- **SSE live em HA**: o buffer de eventos live do service é in-memory por
+  processo; com múltiplas réplicas o SSE pode ficar mudo se o POST do runner
+  e o GET da UI caírem em réplicas diferentes. Desenho: mover o buffer para
+  Redis pub/sub (canal `echo-live:{executionId}`, TTL curto) com fallback
+  in-memory quando Redis não configurado. Não implementado — fica com o time
+  da experiência live (`echo-live*` estava fora da fronteira deste trabalho).
+- **Deploy real no cluster** (imagem, gateway, config) — feito fora deste
+  repo; este README + `gateway/README.md` são o guia.
