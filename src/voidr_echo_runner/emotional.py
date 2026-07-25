@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .models import EmotionalModel, Persona
-from .textutil import normalize
+from .textutil import keyword_matches, normalize
 
 HIGH_LATENCY_S = 3.5
 # Jaccard similarity over normalized token sets for "agent repeated himself".
@@ -109,11 +109,19 @@ class AppraisalDetector:
 
     Rules/keywords first (deterministic, zero cost); journey progress comes
     from the existing keyword state classifier via the `state_changed` flag.
+
+    E4 (DEVIATIONS-METHODOLOGY §4.4): `jargon_terms` extends the static
+    `jargao_tecnico` keyword list with the terms THIS persona does not know
+    (the `unknown`/`confused` partitions of her resolved glossary vocabulary)
+    — the agent saying "roaming" to a persona that doesn't know "roaming"
+    fires the same appraisal event, which nudges her to ask for an
+    explanation (the U1 probe the judge closes with glossaryTermId).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, jargon_terms: tuple[str, ...] = ()) -> None:
         self._questions: list[frozenset[str]] = []
         self._data_requested: set[str] = set()
+        self._jargon_terms = tuple(t for t in jargon_terms if t and len(t.strip()) >= 3)
 
     def detect(
         self,
@@ -155,6 +163,13 @@ class AppraisalDetector:
         for event, keywords in _KEYWORD_EVENTS.items():
             if any(kw in norm for kw in keywords):
                 events.append(event)
+
+        # E4: persona-specific unknown/confused glossary terms — whole-word
+        # match (keyword_matches) to avoid substring false positives.
+        if "jargao_tecnico" not in events and any(
+            keyword_matches(term, agent_text) for term in self._jargon_terms
+        ):
+            events.append("jargao_tecnico")
         return events
 
 
@@ -196,12 +211,18 @@ class EmotionalStateMachine:
     unreachable).
     """
 
-    def __init__(self, model: EmotionalModel, *, seed: int | None = None):
+    def __init__(
+        self,
+        model: EmotionalModel,
+        *,
+        seed: int | None = None,
+        jargon_terms: tuple[str, ...] = (),
+    ):
         self.model = model
         self.seed = seed  # recorded for reproducibility; rules are pure (see module docstring)
         self.emotion = model.initialEmotion
         self.intensity = model.initialIntensity
-        self.detector = AppraisalDetector()
+        self.detector = AppraisalDetector(jargon_terms)
         self.history: list[EmotionalTurn] = []
         self._asked_human = False
         self._hung_up = False
@@ -209,7 +230,14 @@ class EmotionalStateMachine:
     @classmethod
     def for_persona(cls, persona: Persona, *, seed: int | None = None) -> EmotionalStateMachine:
         model = persona.emotionalModel or EmotionalModel()
-        return cls(model, seed=seed)
+        # E4: the persona's unknown/confused glossary terms extend the
+        # jargao_tecnico detector — deterministic, resolved by the service.
+        vocab = persona.glossaryVocabulary
+        jargon_terms = tuple(
+            entry.term
+            for entry in ((vocab.unknown if vocab else []) + (vocab.confused if vocab else []))
+        )
+        return cls(model, seed=seed, jargon_terms=jargon_terms)
 
     def update(
         self,

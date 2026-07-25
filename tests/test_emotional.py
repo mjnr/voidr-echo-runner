@@ -74,6 +74,49 @@ def test_keyword_events(utterance, event):
     assert event in AppraisalDetector().detect(utterance)
 
 
+# --- E4: jargao_tecnico ligado ao vocabulário da persona -------------------------
+
+
+def test_persona_unknown_terms_extend_jargao_tecnico():
+    det = AppraisalDetector(("roaming", "franquia de dados"))
+    assert "jargao_tecnico" in det.detect("O roaming internacional está ativo na sua linha.")
+    assert "jargao_tecnico" in det.detect("A sua franquia de dados acabou.")
+    # Whole-word: no substring false positive.
+    assert "jargao_tecnico" not in det.detect("Vou verificar o seu plano agora.")
+
+
+def test_static_jargao_keywords_still_fire_without_persona_terms():
+    assert "jargao_tecnico" in AppraisalDetector().detect(
+        "Consta uma fatura em aberto na titularidade."
+    )
+
+
+def test_jargao_not_duplicated_when_static_and_persona_terms_both_match():
+    det = AppraisalDetector(("titularidade",))
+    events = det.detect("Preciso confirmar a titularidade da linha.")
+    assert events.count("jargao_tecnico") == 1
+
+
+def test_for_persona_wires_glossary_vocabulary_into_detector():
+    from voidr_echo_runner.models import (
+        GlossaryConfusedTerm,
+        GlossaryUnknownTerm,
+        GlossaryVocabulary,
+    )
+
+    persona = marcia().model_copy(
+        update={
+            "glossaryVocabulary": GlossaryVocabulary(
+                unknown=[GlossaryUnknownTerm(termId="t1", term="roaming")],
+                confused=[GlossaryConfusedTerm(termId="t2", term="franquia", trap="acha que é loja")],
+            )
+        }
+    )
+    machine = EmotionalStateMachine.for_persona(persona, seed=42)
+    rec = machine.update("O roaming da sua linha está ativo, e a franquia acabou.")
+    assert "jargao_tecnico" in rec.events
+
+
 def test_latency_and_state_change_signals():
     det = AppraisalDetector()
     events = det.detect("Certo.", state_changed=True, latency_s=5.0)
