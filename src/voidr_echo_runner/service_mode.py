@@ -155,8 +155,17 @@ class VoidrApi:
     def get_journey_flow(self, flow_id: str) -> dict:
         return self._request("GET", f"/echo/journey-flows/{flow_id}")
 
-    def get_persona(self, persona_id: str) -> dict:
-        return self._request("GET", f"/echo/personas/{persona_id}")
+    def get_persona(self, persona_id: str, knowledge_level: str | None = None) -> dict:
+        """Persona + resolved glossary vocabulary (E3).
+
+        `knowledge_level` is the ephemeral "conhecimento do assunto" override
+        of this run — UNIFIED with glossary mastery: the service recomputes
+        the deterministic partition with the adjusted rate (same seed).
+        """
+        query = "?vocabulary=1"
+        if knowledge_level:
+            query += f"&knowledgeLevel={knowledge_level}"
+        return self._request("GET", f"/echo/personas/{persona_id}{query}")
 
     def put_shard(self, execution_id: str, index: int, payload: dict) -> dict:
         return self._request("PUT", f"/executions/{execution_id}/shards/{index}", json=payload)
@@ -237,6 +246,10 @@ def persona_from_service(doc: dict) -> Persona:
             "psychometrics": doc.get("psychometrics"),
             "behaviors": doc.get("behaviors"),
             "emotionalModel": doc.get("emotionalModel"),
+            # v2.1 (E3): literacy axis + glossary vocabulary resolved by the
+            # service (texts, not ids) — flows into the persona-turn prompt.
+            "literacy": doc.get("literacy"),
+            "glossaryVocabulary": doc.get("glossaryVocabulary"),
         }
     )
 
@@ -655,11 +668,16 @@ def serve_execution(out_dir: Path) -> int:
             persona_source = "execution"
         if not persona_id:
             raise ServeExecutionError(f"case {target['testCaseSlug']} has no voice.personaId")
-        persona = persona_from_service(api.get_persona(persona_id))
 
         from .overrides import PersonaOverrides, apply_overrides
 
         overrides = PersonaOverrides.model_validate(plan_entry.get("overrides") or {})
+        # E3 unification: the "conhecimento do assunto" override (the same
+        # techSavviness knob) also adjusts the glossary partition — the
+        # service recomputes it with the adjusted mastery rate, SAME seed.
+        persona = persona_from_service(
+            api.get_persona(persona_id, knowledge_level=overrides.techSavviness)
+        )
         persona_overrides_record = overrides.as_record()
         if persona_overrides_record:
             persona = apply_overrides(persona, overrides)

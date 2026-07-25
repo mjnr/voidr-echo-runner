@@ -165,6 +165,46 @@ class EmotionalThresholds(BaseModel):
     desligar: float = 1.1
 
 
+class PersonaLiteracy(BaseModel):
+    """v2.1 literacy axis (DEVIATIONS-METHODOLOGY §3.4): the INAF level's
+    deterministic derivations (sentence tolerance, steps per turn,
+    embarrassment-"sim") live in the hive prompt table — here only the axes."""
+
+    inafLevel: str
+    digitalFluency: str | None = None
+    numeracy: str | None = None
+
+
+class GlossaryPopularTerm(BaseModel):
+    termId: str | None = None
+    term: str
+    synonym: str
+
+
+class GlossaryUnknownTerm(BaseModel):
+    termId: str | None = None
+    term: str
+
+
+class GlossaryConfusedTerm(BaseModel):
+    termId: str | None = None
+    term: str
+    trap: str | None = None
+
+
+class GlossaryVocabulary(BaseModel):
+    """Resolved glossary partition for THIS persona (and this run's ephemeral
+    "conhecimento do assunto" level) — computed by the service, passed through
+    to the hive persona-turn prompt untouched."""
+
+    masteryRate: float | None = None
+    band: str | None = None
+    knowledgeLevel: str | None = None
+    popularOnly: list[GlossaryPopularTerm] = Field(default_factory=list)
+    unknown: list[GlossaryUnknownTerm] = Field(default_factory=list)
+    confused: list[GlossaryConfusedTerm] = Field(default_factory=list)
+
+
 class EmotionalModel(BaseModel):
     """PERSONAS-SOTA.md P0.3 — deterministic emotional state machine config.
 
@@ -202,6 +242,10 @@ class Persona(BaseModel):
     goalTemplate: str = ""
     vocabulary: list[str] = Field(default_factory=list)
     massaProfile: str = ""
+    # v2.1 (E3): literacy axis + resolved glossary vocabulary — both optional
+    # (legacy personas and YAML catalogs simply don't have them).
+    literacy: PersonaLiteracy | None = None
+    glossaryVocabulary: GlossaryVocabulary | None = None
 
 
 def load_persona_catalog(path: Path) -> dict[str, Persona]:

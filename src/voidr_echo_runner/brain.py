@@ -245,6 +245,20 @@ class LLMBrain:
                     "desligar": model.thresholds.desligar,
                 },
             }
+        # v2.1 (E3): literacy axis + glossary vocabulary resolved by the
+        # service — the hive renders the <letramento-e-vocabulario> block
+        # (popular synonyms, unknown jargon, confused terms). Older hives
+        # strip unknown keys (zod), so sending them is always safe.
+        if self.persona.literacy is not None:
+            v2["literacy"] = {
+                key: value
+                for key, value in self.persona.literacy.model_dump().items()
+                if value is not None
+            }
+        if self.persona.glossaryVocabulary is not None:
+            vocab = self.persona.glossaryVocabulary.model_dump(exclude_none=True)
+            if vocab.get("popularOnly") or vocab.get("unknown") or vocab.get("confused"):
+                v2["glossaryVocabulary"] = vocab
         # Full v2 speech block: regional particles, hesitations, tu/você axis
         # and curated exemplars. Sending only disfluencyRate was the gap that
         # flattened every persona into the same generic caller.

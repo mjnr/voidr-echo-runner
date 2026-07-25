@@ -256,6 +256,68 @@ def test_legacy_hive_fallback_embeds_journey_goal(hive_env, persona):
     assert "journeyGoal" not in bodies[2]
 
 
+def test_literacy_and_glossary_vocabulary_reach_the_hive(hive_env, persona):
+    """E3: the v2.1 axes travel in the persona payload — the hive renders the
+    <letramento-e-vocabulario> block from them."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    from voidr_echo_runner.models import (
+        GlossaryPopularTerm,
+        GlossaryUnknownTerm,
+        GlossaryVocabulary,
+        PersonaLiteracy,
+    )
+
+    enriched = persona.model_copy(deep=True)
+    enriched.literacy = PersonaLiteracy(
+        inafLevel="rudimentar", digitalFluency="nenhuma", numeracy="baixa"
+    )
+    enriched.glossaryVocabulary = GlossaryVocabulary(
+        masteryRate=0.3,
+        band="baixo",
+        popularOnly=[GlossaryPopularTerm(termId="t1", term="fatura", synonym="a conta")],
+        unknown=[GlossaryUnknownTerm(termId="t2", term="roaming")],
+    )
+
+    brain = LLMBrain(enriched, goal="segunda via", seed=1, client=_client(handler))
+    brain.reply("Bom dia!")
+
+    p = captured["body"]["persona"]
+    assert p["literacy"] == {
+        "inafLevel": "rudimentar",
+        "digitalFluency": "nenhuma",
+        "numeracy": "baixa",
+    }
+    assert p["glossaryVocabulary"]["popularOnly"] == [
+        {"termId": "t1", "term": "fatura", "synonym": "a conta"}
+    ]
+    assert p["glossaryVocabulary"]["unknown"] == [{"termId": "t2", "term": "roaming"}]
+
+
+def test_empty_glossary_vocabulary_is_omitted(hive_env, persona):
+    """A vocabulary with no term lists adds noise, not signal — omitted."""
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return _ok_response()
+
+    from voidr_echo_runner.models import GlossaryVocabulary
+
+    enriched = persona.model_copy(deep=True)
+    enriched.glossaryVocabulary = GlossaryVocabulary(masteryRate=0.9, band="alto")
+
+    brain = LLMBrain(enriched, goal="saldo", seed=1, client=_client(handler))
+    brain.reply("Bom dia!")
+
+    assert "glossaryVocabulary" not in captured["body"]["persona"]
+    assert "literacy" not in captured["body"]["persona"]
+
+
 def test_history_accumulates_and_cost_sums(hive_env, persona):
     brain = LLMBrain(persona, goal="g", client=_client(lambda _: _ok_response()))
     brain.reply("primeiro turno")

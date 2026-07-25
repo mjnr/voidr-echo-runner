@@ -94,6 +94,11 @@ class PersonaOverrides(BaseModel):
     patienceLevel: int | None = Field(default=None, ge=1, le=5)
     # Multiplier over positive trigger deltas: 2.0 = twice as reactive.
     emotionalIntensity: float | None = Field(default=None, ge=0.25, le=3.0)
+    # "Conhecimento do assunto" — UNIFIED with glossary mastery (E3): besides
+    # swapping the temperament axis here, serve-execution forwards this value
+    # to GET /echo/personas/:id?knowledgeLevel=… so the service recomputes the
+    # glossary partition (baixa≈25% / media≈55% / alta≈90% dos termos) with
+    # the persona's own seed. One knob, one concept.
     techSavviness: str | None = None
     verbosity: str | None = None
     spice: str | None = None

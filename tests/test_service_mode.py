@@ -291,6 +291,59 @@ def test_persona_from_service_maps_v2_blocks():
     assert persona.emotionalModel.triggers[0].on == "repetiu_pergunta"
 
 
+def test_persona_from_service_maps_literacy_and_glossary_vocabulary():
+    """E3: v2.1 axes (literacy + resolved glossary vocabulary) flow through."""
+    from voidr_echo_runner.service_mode import persona_from_service
+
+    persona = persona_from_service(
+        {
+            "_id": "6a2",
+            "slug": "gen-s7-mineiro-rudimentar",
+            "name": "Zé (61, mineiro)",
+            "literacy": {"inafLevel": "rudimentar", "digitalFluency": "nenhuma", "numeracy": "baixa"},
+            "glossaryVocabulary": {
+                "masteryRate": 0.3,
+                "band": "baixo",
+                "knowledgeLevel": "baixa",
+                "popularOnly": [{"termId": "t1", "term": "fatura", "synonym": "a conta"}],
+                "unknown": [{"termId": "t2", "term": "roaming"}],
+                "confused": [],
+            },
+            "demographics": {"ageBand": "60+", "region": "mineiro"},
+            "temperament": {
+                "mood": "confuso",
+                "patienceLevel": 3,
+                "techSavviness": "baixa",
+                "verbosity": "normal",
+                "intentNoise": "nenhum",
+            },
+            "speech": {"disfluencyRate": 0.3},
+            "goalTemplate": "",
+        }
+    )
+    assert persona.literacy.inafLevel == "rudimentar"
+    assert persona.glossaryVocabulary.masteryRate == 0.3
+    assert persona.glossaryVocabulary.popularOnly[0].synonym == "a conta"
+    assert persona.glossaryVocabulary.unknown[0].term == "roaming"
+
+
+def test_get_persona_forwards_knowledge_level():
+    """E3 unification: the ephemeral 'conhecimento do assunto' override goes
+    to the service as knowledgeLevel so the glossary partition follows it."""
+    from voidr_echo_runner.service_mode import VoidrApi
+
+    calls: list[str] = []
+
+    api = VoidrApi.__new__(VoidrApi)
+    api._request = lambda method, path, **kw: calls.append(path) or {}  # type: ignore[attr-defined]
+
+    api.get_persona("dona-marcia")
+    api.get_persona("dona-marcia", knowledge_level="baixa")
+
+    assert calls[0] == "/echo/personas/dona-marcia?vocabulary=1"
+    assert calls[1] == "/echo/personas/dona-marcia?vocabulary=1&knowledgeLevel=baixa"
+
+
 def test_persona_from_service_accepts_free_traits_string():
     # The service stores profile.freeTraits as a single "a; b" string (hive
     # contract); the runner model must coerce it into a list.
