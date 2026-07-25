@@ -246,6 +246,19 @@ class StereoCallRecorder:
         # audio redactor map transcript spans back to WAV intervals.
         self.segments: list[tuple[str, int, int]] = []
 
+    def add_silence(self, seconds: float, line_pcm: bytes | None = None) -> None:
+        """Inter-turn gap on BOTH channels (humanized latency made audible).
+
+        `line_pcm` optionally carries ambience-only audio for the tester side
+        (the phone line is never perfectly dead)."""
+        n_bytes = max(0, int(seconds * self.sample_rate)) * 2
+        if n_bytes == 0:
+            return
+        left = bytearray(line_pcm[:n_bytes]) if line_pcm else bytearray(n_bytes)
+        left.extend(b"\x00" * (n_bytes - len(left)))
+        self._left.extend(left)
+        self._right.extend(b"\x00" * n_bytes)
+
     def add(self, channel: str, pcm: bytes) -> int:
         """Append one utterance; returns its segment index."""
         start_sample = len(self._left) // 2
@@ -287,10 +300,19 @@ class AudioTransportAdapter:
     """Wraps a text-level CallTransport, converting agent audio -> text (STT)
     and tester text -> audio (TTS). CallRunner stays media-agnostic."""
 
-    def __init__(self, inner, engine: PipecatAudioEngine, recorder: StereoCallRecorder):
+    def __init__(
+        self,
+        inner,
+        engine: PipecatAudioEngine,
+        recorder: StereoCallRecorder,
+        channel_fx=None,
+    ):
         self.inner = inner
         self.engine = engine
         self.recorder = recorder
+        # TelephoneChannelFx (callfx.py): telephone band-pass + µ-law grit +
+        # seeded ambience applied to the TESTER audio only, before send.
+        self.channel_fx = channel_fx
         self.stt_turns = 0
         self.tts_turns = 0
         # (segment_index, speaker, text) — feeds the post-call audio redactor.
@@ -306,8 +328,15 @@ class AudioTransportAdapter:
         await self.inner.connect()
         await self.inner.send_event("set_mode", mode="audio")
 
+    def record_silence(self, seconds: float) -> None:
+        """Humanized pre-reply gap, audible in the WAV (with line ambience)."""
+        line = self.channel_fx.comfort_noise(seconds) if self.channel_fx else None
+        self.recorder.add_silence(seconds, line_pcm=line)
+
     async def send_text(self, text: str) -> None:
         pcm = await self.engine.synthesize(text)
+        if self.channel_fx is not None:
+            pcm = self.channel_fx.process(pcm)
         segment = self.recorder.add("tester", pcm)
         self.utterances.append((segment, "tester", text))
         self.tts_turns += 1

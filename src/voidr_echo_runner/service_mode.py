@@ -689,6 +689,15 @@ def serve_execution(out_dir: Path) -> int:
 
         case, call_target = build_case(target, case_doc, persona.id, flow, params, plan_id)
         seed = voice_config.get("seed") or 0
+        # EXEC-REALISM: personal massa of this call — ECHO_MASSA (JSON in
+        # ENVIRONMENT_PARAMS, managed service-side) with fallback to the
+        # persona's own identity facts. Values feed the PII deny-list via
+        # case.massa BEFORE the redaction session is built.
+        from .humanize import Humanizer, MassaFacts
+
+        massa = MassaFacts.resolve(params, persona)
+        if massa:
+            case.massa = dict(massa.values)
         # PII redaction (ARCHITECTURE.md section 10) — ALWAYS on in service
         # mode; deny-list from the ENVIRONMENT_PARAMS values used by the case.
         redaction = build_session_for_case(case)
@@ -717,16 +726,48 @@ def serve_execution(out_dir: Path) -> int:
         from .emotional import EmotionalStateMachine
 
         emotional = EmotionalStateMachine.for_persona(persona, seed=seed)
-        # Persona brain from the environment (ECHO_BRAIN, default scripted).
-        # llm = hive persona-turn (needs HIVE_* envs) — those sessions trigger
-        # the service's persona-fidelity judge.
-        brain_kind = (params.get("ECHO_BRAIN") or "scripted").strip().lower()
+        # Persona brain: default is LLM (hive persona-turn) whenever the hive
+        # is reachable — EXECUTIONS MUST RUN THE SAME RICH PERSONA AS THE
+        # PLAYGROUND (founder report: execution felt "pragmatic" because it
+        # silently fell back to the scripted brain). ECHO_BRAIN=scripted still
+        # forces the deterministic brain; without hive credentials we fall
+        # back to scripted LOUDLY.
+        hive_available = bool(
+            os.environ.get("HIVE_URL") and os.environ.get("HIVE_GATEWAY_TOKEN")
+        )
+        brain_kind = (
+            (params.get("ECHO_BRAIN") or ("llm" if hive_available else "scripted"))
+            .strip()
+            .lower()
+        )
         if brain_kind not in ("scripted", "llm"):
             raise ServeExecutionError(f"invalid ECHO_BRAIN {brain_kind!r} (scripted|llm)")
+        if brain_kind == "scripted" and not params.get("ECHO_BRAIN"):
+            print(
+                "  ⚠ hive indisponível (HIVE_URL/HIVE_GATEWAY_TOKEN ausentes) — "
+                "caindo para o brain SCRIPTED: a persona NÃO terá o condicionamento "
+                "rico do playground nesta execução",
+                file=sys.stderr,
+            )
+        # EXEC-REALISM: memory imperfection + humanized timing (default ON;
+        # ECHO_HUMAN_REALISM=0 disables everything, ECHO_HUMAN_TIMING=0 keeps
+        # lapses/massa but removes the latency).
+        humanizer = None
+        if (params.get("ECHO_HUMAN_REALISM") or "1") != "0":
+            humanizer = Humanizer(
+                persona,
+                seed,
+                massa,
+                timing_enabled=(params.get("ECHO_HUMAN_TIMING") or "1") != "0",
+            )
         brain = build_brain(brain_kind, persona, case.goal, seed)
         if brain_kind == "llm":
             brain.redaction = redaction  # deny-list of the case massa
             brain.emotional = emotional  # structured emotionalState per turn
+            if massa:
+                # Personal-data card: labels + {{massa.*}} placeholders only —
+                # values are substituted runner-side (humanizer.finalize_reply).
+                brain.personal_data = massa.personal_data_lines()
             if persona_overrides_record:
                 # Prompt-visible variation block (adherence is judge-verified).
                 brain.execution_overrides = overrides
@@ -735,16 +776,27 @@ def serve_execution(out_dir: Path) -> int:
             # IVR digits at answer time, with `w` (0.5s) pauses between steps.
             send_digits = "ww" + "ww".join(step.send for step in case.dial_plan.dtmf_steps)
         transport = build_transport(call_target, send_digits=send_digits)
-        engine = recorder = None
+        engine = recorder = channel_fx = None
         receive_timeout = 10.0
         if mode == "audio":
             os.environ.setdefault("LOGURU_LEVEL", "WARNING")  # quiet pipecat logs
             # Imports pipecat; validates DEEPGRAM/ELEVENLABS keys with clear errors.
             from .audio import AudioTransportAdapter, PipecatAudioEngine, StereoCallRecorder
+            from .callfx import TelephoneChannelFx, parse_ambience
 
             engine = PipecatAudioEngine(voice_id=persona.speech.voiceId)
             recorder = StereoCallRecorder()
-            transport = AudioTransportAdapter(transport, engine, recorder)
+            # EXEC-REALISM: telephone channel on the persona audio — band-pass
+            # 300–3400 Hz + µ-law grit + seeded ambience (ECHO_CALL_AMBIENCE,
+            # default "quiet"; "none" disables). Deterministic per seed.
+            ambience = parse_ambience(params.get("ECHO_CALL_AMBIENCE"))
+            if ambience.enabled:
+                channel_fx = TelephoneChannelFx(
+                    ambience, seed=seed, sample_rate=engine.sample_rate
+                )
+            transport = AudioTransportAdapter(
+                transport, engine, recorder, channel_fx=channel_fx
+            )
             receive_timeout = 45.0  # remote STT+TTS per turn
 
         # Live events (plan Feature 1): default ON in serve-execution —
@@ -776,6 +828,7 @@ def serve_execution(out_dir: Path) -> int:
             receive_timeout=receive_timeout,
             emotional=emotional,
             live=live,
+            humanizer=humanizer,
         )
 
         async def _run_call():
@@ -828,6 +881,8 @@ def serve_execution(out_dir: Path) -> int:
             "executionId": execution_id,
             "shard": {"index": shard_index, "total": shard_total},
         }
+        if humanizer is not None:
+            meta["humanize"] = humanizer.config_record()
         if emotional.history:
             meta["emotionalCurve"] = emotional.curve()
             meta["emotionalFinal"] = {
@@ -843,6 +898,7 @@ def serve_execution(out_dir: Path) -> int:
                 "sttTurns": transport.stt_turns,
                 "ttsTurns": transport.tts_turns,
                 "wavDurationMs": recorder.duration_ms,
+                **({"channelFx": channel_fx.record()} if channel_fx is not None else {}),
             }
             # Audio PII redaction (§10): beeps over word-timestamps, writes
             # call.redacted.wav — the raw recording is never persisted.

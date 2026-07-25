@@ -184,6 +184,15 @@ class LLMBrain:
         # hive that 400s on the new fields we degrade once (contract v2.1).
         self.execution_overrides: Any | None = None
         self._legacy_contract = False
+        # EXEC-REALISM (contract v2.2): per-turn behavioral directives set by
+        # the Humanizer (memory lapses, data dictation) + the persona's
+        # personal-data card (labels + {{massa.*}} placeholders — NEVER real
+        # values; the hive PII guard rejects clear PII by design). Against an
+        # older hive that 400s on the fields we degrade once, folding them
+        # into the goalTemplate text.
+        self.turn_directives: list[str] = []
+        self.personal_data: list[dict[str, str]] = []
+        self._legacy_realism = False
         self.total_cost_usd = 0.0
         self.last_model: str | None = None
         self.last_usage: dict[str, Any] | None = None
@@ -210,6 +219,25 @@ class LLMBrain:
         if self.emotional is not None and self._legacy_emotional:
             # Legacy workaround for hives without the structured field.
             goal_template = f"{goal_template}\n\n{self.emotional.prompt_block()}"
+        if self._legacy_realism:
+            # Old hive without personalData/turnDirectives: fold both into the
+            # only free-text field the old prompt reads.
+            blocks: list[str] = []
+            if self.personal_data:
+                blocks.append(
+                    "[SEUS DADOS PESSOAIS — quando o atendente pedir, dite falando "
+                    "exatamente o placeholder (o sistema substitui fora do LLM):]\n"
+                    + "\n".join(
+                        f"- {item['label']}: {item['placeholder']}" for item in self.personal_data
+                    )
+                )
+            if self.turn_directives:
+                blocks.append(
+                    "[DIRETIVAS DESTE TURNO — siga à risca:]\n"
+                    + "\n".join(f"- {d}" for d in self.turn_directives)
+                )
+            if blocks:
+                goal_template = goal_template + "\n\n" + "\n\n".join(blocks)
         # Identity fields are optional in the contract, but when `name` is set
         # the hive locks the persona identity in the prompt (no more LLM
         # inventing "sou o João" for a persona called Cida).
@@ -293,6 +321,10 @@ class LLMBrain:
             speech["pronouns"] = self.persona.speech.pronouns
         if self.persona.speech.exemplars:
             speech["exemplars"] = list(self.persona.speech.exemplars)[:8]
+        if self.personal_data and not self._legacy_realism:
+            # v2.2: personal-data card (label + placeholder, never values) —
+            # the hive renders the <dados-pessoais> block from it.
+            v2["personalData"] = [dict(item) for item in self.personal_data]
         return {
             "id": self.persona.id,
             **identity,
@@ -350,6 +382,9 @@ class LLMBrain:
                     block["spice"] = spice
                 if block:
                     payload["executionOverrides"] = block
+        if self.turn_directives and not self._legacy_realism:
+            # v2.2: per-turn realism directives (memory lapse, data dictation).
+            payload["turnDirectives"] = list(self.turn_directives)
         return payload
 
     def _post(self, url: str, payload: dict[str, Any]) -> Any:
@@ -391,6 +426,14 @@ class LLMBrain:
             payload = self._build_payload(options)
             response = self._post(url, payload)
         if response.status_code == 400 and (
+            "turnDirectives" in payload or "personalData" in payload.get("persona", {})
+        ):
+            # Old hive schema without the v2.2 realism fields: fold them into
+            # goalTemplate for the rest of the session.
+            self._legacy_realism = True
+            payload = self._build_payload(options)
+            response = self._post(url, payload)
+        if response.status_code == 400 and (
             "journeyGoal" in payload or "executionOverrides" in payload
         ):
             # Old hive schema without the v2.1 fields: embed the journey goal
@@ -417,6 +460,7 @@ class LLMBrain:
             )
 
         data = response.json()
+        self.turn_directives = []  # directives are strictly per-turn
         self.history.append({"role": "persona", "text": data["text"]})
         self.last_model = data.get("model")
         self.last_usage = data.get("usage") or {}

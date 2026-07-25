@@ -48,6 +48,7 @@ class CallRunner:
         receive_timeout: float = RECEIVE_TIMEOUT_S,
         emotional: Any | None = None,
         live: Any | None = None,
+        humanizer: Any | None = None,
     ):
         self.case = case
         self.flow = flow
@@ -64,6 +65,10 @@ class CallRunner:
         # LivePublisher (live_events.py): fire-and-forget tap on the hooks
         # below — real-time UI feed, never blocks nor fails the call.
         self.live = live
+        # Humanizer (humanize.py, EXEC-REALISM): plans memory lapses per agent
+        # turn (prompt directives for the LLM brain), substitutes {{massa.*}}
+        # placeholders in the reply and produces the humanized reply latency.
+        self.humanizer = humanizer
         self._last_reply_monotonic: float | None = None
 
     def _now_ms(self) -> int:
@@ -232,7 +237,46 @@ class CallRunner:
                 **({"action": emo.action} if emo.action else {}),
             )
 
+        plan = None
+        if self.humanizer is not None:
+            plan = self.humanizer.plan_turn(text)
+            if plan.directives and hasattr(self.brain, "turn_directives"):
+                self.brain.turn_directives = list(plan.directives)
+
         reply = self.brain.reply(text)
+
+        if self.humanizer is not None and plan is not None:
+            if plan.memory_lapse and not hasattr(self.brain, "turn_directives"):
+                # ScriptedBrain has no prompt — prefix the hesitation locally.
+                prefix = self.humanizer.scripted_prefix(plan)
+                if prefix:
+                    reply = prefix + reply[0].lower() + reply[1:] if reply else prefix
+            # {{massa.*}} placeholders become real values OUTSIDE the LLM;
+            # persisted artifacts are redacted later (deny-list covers them).
+            reply = self.humanizer.finalize_reply(reply)
+            if self.humanizer.timing_enabled:
+                import asyncio
+
+                delay_s = self.humanizer.reply_delay_s(
+                    reply,
+                    plan,
+                    emotion_intensity=(
+                        self.emotional.intensity if self.emotional is not None else None
+                    ),
+                )
+                self._record_event(
+                    "humanized_turn",
+                    turn=self._turn,
+                    delayMs=int(delay_s * 1000),
+                    memoryLapse=plan.memory_lapse,
+                    **({"lapseCategory": plan.lapse_category} if plan.lapse_category else {}),
+                )
+                record_silence = getattr(self.transport, "record_silence", None)
+                if record_silence is not None:
+                    # the WAV shows the human gap (with ambience) on the line
+                    record_silence(delay_s)
+                await asyncio.sleep(delay_s)
+
         self._record_transcript("tester", reply)
         self._record_event("tester_turn", turn=self._turn)
         await self.transport.send_text(reply)

@@ -39,6 +39,20 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--out", type=Path, default=Path("out"))
     run.add_argument("--run-id", default=None)
     run.add_argument(
+        "--ambience",
+        default=None,
+        help=(
+            "telephone-channel ambience for the persona audio "
+            "(none|quiet|home|office|street[:level]); default quiet in audio mode. "
+            "Also honors ECHO_CALL_AMBIENCE."
+        ),
+    )
+    run.add_argument(
+        "--no-humanize",
+        action="store_true",
+        help="disable human realism (memory lapses, humanized reply latency)",
+    )
+    run.add_argument(
         "--no-redaction",
         action="store_true",
         help="DEV ONLY: skip PII redaction of artifacts (never use with real massas)",
@@ -105,9 +119,25 @@ def _run(args: argparse.Namespace) -> int:
         from .emotional import EmotionalStateMachine
 
         emotional = EmotionalStateMachine.for_persona(persona, seed=seed)
+        # EXEC-REALISM: massa from ECHO_MASSA (env JSON) or the persona's own
+        # identity facts; humanizer plans memory lapses + humanized latency.
+        import os as _os
+
+        from .humanize import Humanizer, MassaFacts
+
+        massa = MassaFacts.resolve(
+            {"ECHO_MASSA": _os.environ.get("ECHO_MASSA", "")}, persona
+        )
+        if massa:
+            case.massa = {**case.massa, **massa.values}
+        humanizer = None
+        if not args.no_humanize:
+            humanizer = Humanizer(persona, seed, massa)
         brain = build_brain(args.brain, persona, case.goal, seed)
         if args.brain == "llm":
             brain.emotional = emotional  # current state injected per turn
+            if massa:
+                brain.personal_data = massa.personal_data_lines()
             # The history sent to the hive must carry massa as placeholders
             # (the gateway 422s on clear PII) — share the case deny-list.
             from .redaction import build_session_for_case
@@ -123,7 +153,7 @@ def _run(args: argparse.Namespace) -> int:
                 step.send for step in case.dial_plan.dtmf_steps
             )
         transport = build_transport(args.target, send_digits=send_digits)
-        engine = recorder = None
+        engine = recorder = channel_fx = None
         receive_timeout = 10.0
         if args.mode == "audio":
             import os
@@ -131,10 +161,20 @@ def _run(args: argparse.Namespace) -> int:
             os.environ.setdefault("LOGURU_LEVEL", "WARNING")  # quiet pipecat logs
             # Imports pipecat; validates DEEPGRAM/ELEVENLABS keys with clear errors.
             from .audio import AudioTransportAdapter, PipecatAudioEngine, StereoCallRecorder
+            from .callfx import TelephoneChannelFx, parse_ambience
 
             engine = PipecatAudioEngine(voice_id=persona.speech.voiceId)
             recorder = StereoCallRecorder()
-            transport = AudioTransportAdapter(transport, engine, recorder)
+            ambience = parse_ambience(
+                args.ambience or os.environ.get("ECHO_CALL_AMBIENCE")
+            )
+            if ambience.enabled:
+                channel_fx = TelephoneChannelFx(
+                    ambience, seed=seed, sample_rate=engine.sample_rate
+                )
+            transport = AudioTransportAdapter(
+                transport, engine, recorder, channel_fx=channel_fx
+            )
             receive_timeout = 45.0  # remote STT+TTS per turn
     except Exception as exc:  # noqa: BLE001 — setup errors are user-facing
         print(f"echo-runner: setup error: {exc}", file=sys.stderr)
@@ -174,6 +214,7 @@ def _run(args: argparse.Namespace) -> int:
         receive_timeout=receive_timeout,
         emotional=emotional,
         live=live,
+        humanizer=humanizer,
     )
 
     async def _run_call():
@@ -209,6 +250,8 @@ def _run(args: argparse.Namespace) -> int:
         # trigger for the service's persona-fidelity judge (P0.4).
         "brain": args.brain,
     }
+    if humanizer is not None:
+        meta["humanize"] = humanizer.config_record()
     if emotional.history:
         meta["emotionalCurve"] = emotional.curve()
         meta["emotionalFinal"] = {
@@ -223,6 +266,7 @@ def _run(args: argparse.Namespace) -> int:
             "sttTurns": transport.stt_turns,
             "ttsTurns": transport.tts_turns,
             "wavDurationMs": recorder.duration_ms,
+            **({"channelFx": channel_fx.record()} if channel_fx is not None else {}),
         }
 
     wav_path = None
