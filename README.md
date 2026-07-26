@@ -6,8 +6,8 @@ encarnando uma persona e avalia a trajetória contra um journey flow (máquina d
 estados). Irmão de `voidr-runner` (Playwright) e `voidr-k6-runner` (k6) — mesmo
 contrato de report, outra mídia.
 
-O modo texto roda **100% offline** contra o
-[`vivo-autopilot-mock`](../vivo-autopilot-mock). O modo áudio usa STT/TTS reais
+O modo texto usa o Hive para toda fala da persona e pode chamar o
+[`vivo-autopilot-mock`](../vivo-autopilot-mock) como alvo. O modo áudio usa STT/TTS reais
 (Deepgram + ElevenLabs via Pipecat) e o transporte Twilio faz chamadas PSTN de
 verdade. O playground de personas (`echo-runner chat`) conversa com a persona
 via LLM — sempre através do hive, nunca com chave de LLM local. Nenhum dado
@@ -26,8 +26,7 @@ uv run echo-runner run --case cases/consulta-saldo-tc-001.yaml --target ws://loc
 ```
 
 Exit code: `0` passed · `1` failed · `2` erro de setup. Flags: `--mode
-text|audio` (default text), `--brain scripted|llm` (default scripted),
-`--personas`, `--out`, `--run-id`.
+text|audio` (default text), `--personas`, `--out`, `--run-id`.
 
 ### Smoke E2E (gate da fase 1)
 
@@ -47,16 +46,18 @@ offline. Testes unitários: `uv run pytest`.
 README do mock):
 
 ```bash
-# exige DEEPGRAM_API_KEY e ELEVENLABS_API_KEY (no .env dos dois repos)
+# exige LiteLLM local ou remoto com uma virtual key multimodal
 uv run echo-runner run --case cases/consulta-saldo-tc-001.yaml \
   --target ws://localhost:8765/ws --seed 42 --mode audio
 ```
 
-- **STT**: `DeepgramSTTService` do Pipecat (websocket streaming, `nova-2`,
-  `language=pt-BR`) — cada fala do agente chega como áudio e o transcript é o
-  que o STT ouviu de verdade (`entries[].source == "stt"`).
-- **TTS**: `ElevenLabsHttpTTSService` do Pipecat (`eleven_flash_v2_5`,
-  `language=pt`, PCM 16 kHz). Vozes por persona (premade da voice library,
+- **STT**: captura e reconhecimento se sobrepõem pelo WebSocket governado
+  `/v1/audio/transcriptions/stream`; resultados interim chegam antes do fim da
+  fala, finais são ordenados e a fila limitada aplica backpressure.
+- **TTS**: `/audio/speech` recebe `output_format=pcm_16000`; o runner só expõe
+  16 kHz após validar metadata/header da resposta e resampleia quando a taxa
+  declarada diverge. PCM sem taxa declarada falha fechado.
+  Vozes por persona (premade da voice library,
   em `personas/catalog.yaml`):
 
 | Persona | Voz ElevenLabs | voiceId |
@@ -65,8 +66,8 @@ uv run echo-runner run --case cases/consulta-saldo-tc-001.yaml \
 | `carlos-34-paulista` | Liam (masculino, jovem) | `TX3LPaxmHKxFdv7VOQHJ` |
 | agente do mock | Sarah (via `MOCK_TTS_VOICE_ID`) | `EXAVITQu4vr4xnSDxMaL` |
 
-- O cérebro continua o `ScriptedBrain` determinístico — o áudio é a camada
-  nova; a arquitetura é `CallRunner` (inalterado) + `AudioTransportAdapter`
+- Toda fala tester vem de `persona-turn/v3` no Hive; a arquitetura é
+  `CallRunner` + `AudioTransportAdapter`
   (`audio.py`), que converte áudio→texto e texto→áudio com pipelines Pipecat
   reais por turno.
 - Artifacts extras em `out/<run-id>/`: `call.redacted.wav` (estéreo: L =
@@ -91,9 +92,8 @@ ElevenLabs) + ~10 min de STT Deepgram (~USD 0.06).
 
 1. **Dial plan**: executa os `dtmf_steps` do case contra a URA (mensagens
    `dtmf` no protocolo WS do mock; ver README do mock).
-2. **Conversa**: a persona (cérebro `ScriptedBrain`, determinístico e seedado)
-   responde cada turno do agente a partir de `goalTemplate` + `vocabulary` +
-   regras por keyword. Mesma seed ⇒ mesmas falas.
+2. **Conversa**: o Hive redige cada fala via `persona-turn/v3`; seed, estado
+   emocional e diretivas de realismo condicionam o turno sem fala local pronta.
 3. **Rastreio**: um classificador v0 por keywords mapeia cada turno do agente
    para um estado do journey flow (JSON, formato da seção 6.1 do
    ARCHITECTURE.md) e registra a trajetória.
@@ -155,7 +155,7 @@ na conversa ao vivo), 1 chamada REST por segmento com PII.
 
 **Caminhos protegidos**: artifacts (`transcript/timeline/report`), payload do
 `POST /echo/sessions` (transcript, timeline, deviations, target), history
-enviado ao `persona-turn` do hive (que também valida — 422 com PII em claro) e
+enviado ao `persona-turn/v3` do hive (que também valida — 422 com PII em claro) e
 os eventos `dtmf_sent` da timeline (código de acesso/ANI digitados).
 
 **Engine**: detector próprio (regex + DV/Luhn + parser de dígitos falados),
@@ -245,15 +245,16 @@ reconexão do stream em 2.9 s e áudio fluindo após, hangup limpo via REST.
 
 "Dar play e conversar com a persona": você digita como o agente da Vivo e a
 persona responde no personagem, com LLM real. Seguindo a regra 8.5 do
-`ARCHITECTURE.md`, **o runner não tem chave de LLM** — o `LLMBrain` chama o
-gateway síncrono do hive (`POST {HIVE_URL}/echo/persona-turn`, auth
-`Bearer HIVE_GATEWAY_TOKEN`), que roteia DeepSeek v4 Pro → Sonnet (escalação)
-e registra billing por organização.
+`ARCHITECTURE.md`, **o runner não tem chave de LLM** — o `LLMBrain` chama
+exclusivamente o contrato idempotente v3 do hive
+(`POST {HIVE_URL}/echo/persona-turn/v3`, auth `Bearer HIVE_GATEWAY_TOKEN`).
+Modelo, prompt e policy são fixados pelo Hive, com provenance e billing por turno.
 
 ```bash
-# envs no .env: HIVE_URL, HIVE_GATEWAY_TOKEN, VOIDR_ORG_ID
+# envs no .env: HIVE_URL, HIVE_GATEWAY_TOKEN, VOIDR_ORG_ID,
+# HIVE_ECHO_PERSONA_V3_MODEL_REVISION (@sha256:<64hex> ou @id:<uuid>, nunca alias)
 uv run echo-runner chat --persona dona-marcia-58-mineira \
-  [--journey flows/consulta-saldo-v1.json] [--voice] [--escalate] \
+  [--journey flows/consulta-saldo-v1.json] [--voice] \
   [--seed 42] [--goal "quero saber meu saldo"]
 ```
 
@@ -261,9 +262,9 @@ uv run echo-runner chat --persona dona-marcia-58-mineira \
   estados por keywords sobre o que você digita (a persona fica contextualizada
   na jornada; o estado corrente aparece no rodapé de cada turno). Sem a flag,
   usa o estado genérico `conversa-livre`.
-- **`--voice`** — além do texto, sintetiza a resposta com a voz ElevenLabs da
+- **`--voice`** — além do texto, sintetiza a resposta pelo LiteLLM com a voz da
   persona (`speech.voiceId` do catálogo) e toca no alto-falante (afplay).
-  Sem `ELEVENLABS_API_KEY`, degrada para texto com aviso.
+  Sem URL, virtual key e alias TTS do LiteLLM, degrada para texto com aviso.
 - **`--escalate`** — todos os turnos no modelo de escalação (Sonnet).
 - **`--goal`** — preenche o `{goal}` do `goalTemplate` da persona.
 - **Comandos no prompt**: `/escalate` (força Sonnet no próximo turno),
@@ -275,8 +276,7 @@ acumulado da conversa é impresso na saída. Erros do hive viram mensagens
 claras: `400` payload, `422` PII em claro no history (redija `<CPF>`,
 `<TELEFONE>`), `502` gateway LLM indisponível.
 
-O mesmo cérebro funciona no modo de teste: `echo-runner run ... --brain llm`
-executa o case com a persona LLM em vez do `ScriptedBrain`.
+O mesmo contrato Hive v3 é usado por `run`, `chat` e `serve-execution`.
 
 Para desenvolvimento local, suba o hive da worktree com Mongo/Redis locais e
 aponte `HIVE_URL` para ele (ex.: `http://localhost:3210`).
@@ -308,17 +308,14 @@ registrado e reservado para comportamentos estocásticos futuros, P1.2).
 - **Timeline**: cada turno gera um evento `emotional_state` no `timeline.json`,
   e o `meta` da sessão ganha `emotionalCurve` (estado por turno) e
   `emotionalFinal` — insumo para o painel ("cliente saiu da chamada com
-  frustração 0.9"). Vale para `run` e `serve-execution` (inclusive com
-  `ScriptedBrain`, como telemetria).
+  frustração 0.9"). Vale para `run` e `serve-execution`.
 - **Chat**: o rodapé de cada turno mostra `[emoção 0.45 ↗]`; `/emotion` imprime
   a curva completa com gatilhos e ações.
 
-**Contrato v2 (hive `813fad6`):** o runner envia o campo estruturado
+**Contrato v3:** o runner envia o campo estruturado
 `emotionalState {emotion, intensity, guidance}` no persona-turn (a `guidance`
-vem dos thresholds — ex.: "você DEVE exigir um atendente humano agora"). Se o
-hive responder `400` (schema antigo sem o campo), o `LLMBrain` cai uma vez para
-o workaround legado de embutir o bloco `[ESTADO EMOCIONAL]` no `goalTemplate` e
-mantém o modo legado pelo resto da sessão. O payload também leva os blocos v2
+vem dos thresholds — ex.: "você DEVE exigir um atendente humano agora").
+Não há downgrade para contratos antigos. O payload também leva os blocos
 da persona (`identity.facts`, `psychometrics` OCEAN, `behaviors` e o subset de
 `emotionalModel` que o hive aceita — triggers/decay ficam no runner). Sessões
 com `brain: llm` no report disparam o persona-fidelity judge no service.
@@ -327,8 +324,8 @@ com `brain: llm` no report disparam o persona-fidelity judge no service.
 
 | Camada | v0 | Como ativa |
 |---|---|---|
-| Cérebro da persona | `ScriptedBrain` (determinístico, seedado — default dos testes) | `LLMBrain` **implementado** via hive (`--brain llm` / `echo-runner chat`) — envs `HIVE_URL`, `HIVE_GATEWAY_TOKEN`, `VOIDR_ORG_ID`; sem chave de LLM no runner |
-| Modo áudio | **implementado** (Deepgram + ElevenLabs via Pipecat) | `--mode audio` + `DEEPGRAM_API_KEY` + `ELEVENLABS_API_KEY`; TTS Azure (`AZURE_SPEECH_KEY`) segue stub |
+| Cérebro da persona | Hive `persona-turn/v3` obrigatório | Envs `HIVE_URL`, `HIVE_GATEWAY_TOKEN`, `VOIDR_ORG_ID`; sem chave de LLM no runner |
+| Modo áudio | **implementado** (LiteLLM único para TTS/STT) | `--mode audio` + `LITELLM_BASE_URL` + virtual key + aliases governados |
 | Transporte | `LocalWebSocketTransport` (mock, texto e áudio) | `TwilioMediaStreamTransport` **implementado** — `tel:+E164` + envs `TWILIO_*` + tunnel público (seção acima) |
 
 ## Modo service: `echo-runner serve-execution`
@@ -360,7 +357,7 @@ Fluxo executado:
 3. **Chamada** — `PUT /shards/:i` com `RUNNING`, executa contra o alvo
    (`dialPlan.to`, ex.: `ws://localhost:8765/ws`) com o core deste CLI
    (persona brain seedada + classificador de trajetória + avaliador
-   `flowAssert`).
+   `flowAssert`), com Hive obrigatório para cada fala tester.
 4. **Artifacts** — pede signed URLs em `POST /v1/executions/:id/artifacts/upload-urls`
    e sobe `report.json` (contrato k6: `stats` + `results[{name,status,durationMs,errorMessage?}]`,
    `name` = slug do case) em `shards/{i}/reporter/json/test-results.json`,
@@ -369,14 +366,14 @@ Fluxo executado:
    o service parseia o report (`voice-report.parser.ts`) e persiste
    `testCaseResults` quando o último shard finaliza.
 6. **Sessão** — `POST /v1/echo/sessions` com transcript, trajetória, status
-   (`passed | deviation | escalation | abandoned | env_failure` — mesma
-   precedência do `voice-eval.service.ts`), `deviations[]`, métricas, paths
-   dos artifacts, o slug da persona e `brain` (`scripted | llm`) — sessões
-   `llm` disparam o persona-fidelity judge no service (P0.4).
+   (`passed | deviation | escalation | abandoned | env_failure`), `deviations[]`, métricas, paths
+   dos artifacts, o slug da persona e `brain: llm` — sessões
+   `llm` disparam o persona-fidelity judge no service (P0.4). A classificação
+   detalhada da falha AI (`failed | degraded | inconclusive`) fica no evento
+   `hive_generation_failed` da timeline até o service ganhar campo próprio.
 
-O brain da persona vem de `ENVIRONMENT_PARAMS.ECHO_BRAIN` (`scripted` default,
-`llm` usa o persona-turn do hive — exige `HIVE_URL`/`HIVE_GATEWAY_TOKEN` no
-ambiente do processo). Com `llm`, o runner envia ao hive o `emotionalState`
+O Hive é obrigatório e exige `HIVE_URL`/`HIVE_GATEWAY_TOKEN` no ambiente do
+processo. O runner envia ao Hive o `emotionalState`
 estruturado por turno e os blocos v2 da persona vindos do service
 (`identity.facts`, `psychometrics`, `behaviors`, `emotionalModel`).
 
@@ -387,6 +384,7 @@ estruturado por turno e os blocos v2 da persona vindos do service
 | `VOIDR_API_URL` | sim | Base do voidr-service (ex.: `http://localhost:3010`; `/v1` é adicionado) |
 | `EXECUTION_ID` | sim | Execution `provider: VOICE` criada no service |
 | `VOIDR_ORG_ID` | sim | Organization id (Auth0) |
+| `HIVE_ECHO_PERSONA_V3_MODEL_REVISION` | sim | Pin verificável (`@sha256:<64hex>` ou `@id:<uuid>`), igual ao Hive; aliases como `deepseek-v4-pro`, `latest` e `prod` são recusados |
 | `VOIDR_CLIENT_ID` / `VOIDR_CLIENT_SECRET` | sim* | Credenciais da service account |
 | `VOIDR_ACCESS_TOKEN` | não | Token pré-mintado pelo dispatch; dispensa o par client id/secret |
 | `SHARDS_CURRENT` / `SHARDS_TOTAL` | sim | Shard deste job (1-based) / total |
@@ -414,9 +412,10 @@ até 5 eventos (1 de áudio por batch) a cada ~300ms, com `seq` crescente e
   falhar 5 batches seguidos.
 - **Privacidade**: o TEXTO dos eventos (`turn`, `dtmf_sent`) passa pela
   deny-list de massas (`{{env.*}}` conhecidos no runtime) antes de sair do
-  processo. O ÁUDIO live NÃO é redigido (a redação de áudio é pós-call):
-  em chamadas com massas reais sensíveis faladas em voz, desligue só o áudio
-  live com `ECHO_LIVE_AUDIO=0` — os eventos semânticos continuam fluindo.
+  processo. O áudio live continua habilitado; quando o texto pareado contém
+  massa ou PII, o PCM da utterance inteira é substituído por silêncio de igual
+  duração antes do publish. O replay persistido continua no pipeline de
+  redação pós-call.
 
 ### Dev local (sem GKE)
 
@@ -444,20 +443,19 @@ Como o mesmo `serve-execution` roda num pod GKE. Componentes:
   ```bash
   docker build -t $REGISTRY/voidr-echo-runner:$TAG .
   docker push $REGISTRY/voidr-echo-runner:$TAG
+  DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' \
+    $REGISTRY/voidr-echo-runner:$TAG)
   ```
 
 - **Dispatch no service** — VOICE cai no cloud dispatch genérico (GKE Job).
   A imagem vem de `jobRunnerConfig.gkeRunnerImage` do environment ou do config
-  `GKE_ECHO_RUNNER_IMAGE` do service; **sem imagem configurada o dispatch
-  VOICE falha com erro claro** (nunca cai na imagem Playwright). Jobs VOICE
-  vão para node pool **on-demand** (não Spot) — preempção derrubaria chamadas
-  em curso.
-- **Secrets** — chegam em `ENVIRONMENT_PARAMS` (JSON) e o runner promove para
-  `os.environ` as chaves `TWILIO_*`, `DEEPGRAM_*`, `ELEVENLABS_*`, `ECHO_*` e
-  `HIVE_*` antes de montar o pipeline (`service_mode.py`;
-  valores de `ENVIRONMENT_PARAMS` vencem o env do processo). `HIVE_URL`/
-  `HIVE_GATEWAY_TOKEN` são injetados pelo service no dispatch quando o
-  environment não os define (brain LLM funciona na nuvem sem `.env`).
+  `GKE_ECHO_RUNNER_IMAGE` do service; a referência deve terminar em
+  `@sha256:<digest>`. Tags mutáveis são rejeitadas. Jobs VOICE vão para node
+  pool **on-demand** (não Spot).
+- **Secrets** — nunca entram no Job spec nem em `ENVIRONMENT_PARAMS`. O KSA
+  dedicado monta arquivos read-only do Secret Manager via CSI; o runner carrega
+  as credenciais de voz e `HIVE_GATEWAY_TOKEN` desses arquivos. O JSON do Job
+  contém apenas a allowlist de configuração não secreta.
 - **Twilio (modo áudio PSTN)** — pod não tem WSS público; use o
   **media gateway** (`gateway/`): Deployment estável com endpoint WSS público,
   runner registra outbound (`ECHO_MEDIA_GATEWAY_URL` +
@@ -468,12 +466,14 @@ Como o mesmo `serve-execution` roda num pod GKE. Componentes:
 ### Checklist de rollout
 
 1. Build + push da imagem do runner para o registry do cluster.
-2. `GKE_ECHO_RUNNER_IMAGE=<registry>/voidr-echo-runner:<tag>` no config do
+2. `GKE_ECHO_RUNNER_IMAGE=<registry>/voidr-echo-runner@sha256:<digest>` no config do
    service (ou `jobRunnerConfig.gkeRunnerImage` por environment).
-3. `HIVE_URL`/`HIVE_GATEWAY_TOKEN` no config do service (fallback para o
-   brain LLM) — ou por environment nos secrets.
-4. Secrets de mídia (`TWILIO_*`, `DEEPGRAM_API_KEY`, `ELEVENLABS_API_KEY`) nos
-   environment secrets da aplicação (viram `ENVIRONMENT_PARAMS`).
+3. `HIVE_URL` e `HIVE_ECHO_PERSONA_V3_MODEL_REVISION` como configuração não
+   secreta; `HIVE_GATEWAY_TOKEN` no Secret Manager projetado por CSI.
+4. Secrets de mídia (`TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN` e
+   `ECHO_MEDIA_GATEWAY_TOKEN`) no Secret Manager do workload VOICE. A virtual
+   key LiteLLM chega ao shard somente pelo envelope privado de uso único; as
+   credenciais de ElevenLabs e Deepgram existem apenas no deployment LiteLLM.
 5. Node pool on-demand disponível (o dispatch VOICE já pede on-demand).
 6. Para PSTN: deploy do `echo-media-gateway` (Deployment + Service + Ingress
    WSS, `gateway/k8s/`), e `ECHO_MEDIA_GATEWAY_URL`/`ECHO_MEDIA_GATEWAY_TOKEN`
@@ -483,6 +483,11 @@ Como o mesmo `serve-execution` roda num pod GKE. Componentes:
 
 ### Pendências conhecidas
 
+- **Único canário real pendente**: com credenciais de staging, executar uma
+  chamada curta ElevenLabs + Deepgram pelo deployment `voidr-lite-llm` e
+  confirmar os headers de taxa emitidos pela versão pinada. Os testes locais
+  usam servidores wire-level (HTTP/WS reais), validam auth, parâmetros,
+  chunks, duração/frames/taxa, interim/final e `Twilio clear`, sem provider key.
 - **SSE live em HA**: o buffer de eventos live do service é in-memory por
   processo; com múltiplas réplicas o SSE pode ficar mudo se o POST do runner
   e o GET da UI caírem em réplicas diferentes. Desenho: mover o buffer para

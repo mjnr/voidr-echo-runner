@@ -2,15 +2,23 @@
 
 from pathlib import Path
 
+import httpx
+import pytest
+
 from voidr_echo_runner.flows import FlowState, JourneyFlow
 from voidr_echo_runner.models import VoiceTestCase
 from voidr_echo_runner.runner import CallResult
 from voidr_echo_runner.service_mode import (
+    ServeExecutionError,
     SessionVerdict,
+    VoidrApi,
     build_case,
     build_session_payload,
+    persist_voice_session,
     promote_params_to_environ,
+    promote_trusted_envelope_to_environ,
     resolve_persona_plan_entry,
+    serve_execution,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,6 +36,24 @@ def _minimal_flow() -> JourneyFlow:
 
 def _call_result() -> CallResult:
     return CallResult(started_at_ms=1000, ended_at_ms=2000, agent_turns=3)
+
+
+def test_serve_execution_rejects_raw_audio_before_api_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("VOIDR_API_URL", "http://service.test")
+    monkeypatch.setenv("EXECUTION_ID", "exec-1")
+    monkeypatch.setenv("VOIDR_ORG_ID", "org-1")
+    monkeypatch.setenv("ENVIRONMENT_PARAMS", '{"ECHO_KEEP_RAW_AUDIO":"1"}')
+
+    assert serve_execution(tmp_path) == 2
+
+
+def test_voice_session_post_error_is_not_swallowed():
+    class BrokenApi:
+        def post_session(self, payload):
+            raise RuntimeError("schema rejected")
+
+    with pytest.raises(RuntimeError, match="schema rejected"):
+        persist_voice_session(BrokenApi(), {"runnerMode": "ai-only-v3"})
 
 
 # ── case YAML schema ─────────────────────────────────────────────────────────
@@ -238,11 +264,15 @@ def test_persona_plan_malformed_json_never_breaks_the_call(capsys):
     assert "ECHO_PERSONA_PLAN inválido" in capsys.readouterr().err
 
 
-# ── serve-execution: promoção de secrets ENVIRONMENT_PARAMS → os.environ ─────
+# ── serve-execution: promoção de configuração não secreta ────────────────────
 
 
-def test_promote_params_covers_media_hive_and_echo_prefixes():
-    env: dict[str, str] = {}
+def test_promote_params_separates_customer_and_platform_configuration():
+    env = {
+        "VOICE_GATEWAY_URL": "wss://platform.voice.internal",
+        "HIVE_URL": "https://platform.hive.internal",
+        "ECHO_RUNTIME_ENV": "production",
+    }
     promoted = promote_params_to_environ(
         {
             "TWILIO_ACCOUNT_SID": "AC123",
@@ -250,6 +280,10 @@ def test_promote_params_covers_media_hive_and_echo_prefixes():
             "DEEPGRAM_API_KEY": "dg",
             "ELEVENLABS_API_KEY": "el",
             "ECHO_CALL_MODE": "audio",
+            "VOICE_GATEWAY_URL": "wss://voice.example",
+            "ECHO_RUNTIME_ENV": "local",
+            "ECHO_MEDIA_GATEWAY_RUNNER_URL": "ws://attacker.invalid",
+            "VOICE_TTS_ADAPTER": "direct",
             "HIVE_URL": "http://hive:3001",
             "HIVE_GATEWAY_TOKEN": "gw",
             "BASE_URL": "https://app.example",  # não promovida (fora dos prefixos)
@@ -257,39 +291,114 @@ def test_promote_params_covers_media_hive_and_echo_prefixes():
         },
         environ=env,
     )
-    assert promoted == sorted(
-        [
-            "TWILIO_ACCOUNT_SID",
-            "TWILIO_AUTH_TOKEN",
-            "DEEPGRAM_API_KEY",
-            "ELEVENLABS_API_KEY",
-            "ECHO_CALL_MODE",
-            "HIVE_URL",
-            "HIVE_GATEWAY_TOKEN",
-        ]
-    )
-    assert env["TWILIO_ACCOUNT_SID"] == "AC123"
-    assert env["HIVE_GATEWAY_TOKEN"] == "gw"
+    assert promoted == ["ECHO_CALL_MODE"]
+    assert env["VOICE_GATEWAY_URL"] == "wss://platform.voice.internal"
+    assert env["HIVE_URL"] == "https://platform.hive.internal"
+    assert env["ECHO_RUNTIME_ENV"] == "production"
+    assert "TWILIO_ACCOUNT_SID" not in env
+    assert "HIVE_GATEWAY_TOKEN" not in env
+    assert "ECHO_MEDIA_GATEWAY_RUNNER_URL" not in env
+    assert "VOICE_TTS_ADAPTER" not in env
+    assert "DEEPGRAM_API_KEY" not in env
+    assert "ELEVENLABS_API_KEY" not in env
     assert "BASE_URL" not in env
     assert "MOCK_ACCESS_CODE" not in env
 
 
-def test_promote_params_overwrites_local_env_but_keeps_fallback():
-    # ENVIRONMENT_PARAMS é a intenção do environment para ESTA execução —
-    # ganha do os.environ herdado (ex.: .env do repo no dev local)...
+def test_customer_params_cannot_overwrite_platform_fallbacks():
     env = {"HIVE_URL": "http://localhost:3001", "DEEPGRAM_API_KEY": "local"}
-    promote_params_to_environ({"HIVE_URL": "http://hive-prod:3001"}, environ=env)
-    assert env["HIVE_URL"] == "http://hive-prod:3001"
-    # ...mas chave ausente do bag preserva o fallback local (dev sem secret
-    # cadastrado no environment continua funcionando via .env).
+    promote_params_to_environ({"HIVE_URL": "http://attacker.invalid"}, environ=env)
+    assert env["HIVE_URL"] == "http://localhost:3001"
     assert env["DEEPGRAM_API_KEY"] == "local"
 
 
+def test_trusted_envelope_promotes_key_and_observability_scope():
+    env = {}
+    promoted = promote_trusted_envelope_to_environ(
+        {
+            "LITELLM_API_KEY": "platform-virtual-key",
+            "VOIDR_ORGANIZATION_ID": "org-trusted",
+            "VOIDR_EXECUTION_ID": "execution-trusted",
+        },
+        environ=env,
+    )
+    assert promoted == [
+        "LITELLM_API_KEY",
+        "VOIDR_EXECUTION_ID",
+        "VOIDR_ORGANIZATION_ID",
+    ]
+    assert env == {
+        "LITELLM_API_KEY": "platform-virtual-key",
+        "VOIDR_ORGANIZATION_ID": "org-trusted",
+        "VOIDR_EXECUTION_ID": "execution-trusted",
+    }
+
+
+def test_client_params_cannot_inject_governed_key_or_scope():
+    env = {
+        "LITELLM_API_KEY": "platform-virtual-key",
+        "VOIDR_ORGANIZATION_ID": "org-trusted",
+        "VOIDR_EXECUTION_ID": "execution-trusted",
+    }
+    promote_params_to_environ(
+        {
+            "LITELLM_API_KEY": "attacker-key",
+            "VOIDR_ORGANIZATION_ID": "org-attacker",
+            "VOIDR_EXECUTION_ID": "execution-attacker",
+        },
+        environ=env,
+    )
+    assert env["LITELLM_API_KEY"] == "platform-virtual-key"
+    assert env["VOIDR_ORGANIZATION_ID"] == "org-trusted"
+    assert env["VOIDR_EXECUTION_ID"] == "execution-trusted"
+
+
+def test_consumed_envelope_rejects_client_key_tenant_and_execution_injection():
+    api = object.__new__(VoidrApi)
+    api._request = lambda *_args, **_kwargs: {
+        "trustedEnv": {
+            "LITELLM_API_KEY": "platform-key",
+            "VOIDR_ORGANIZATION_ID": "org-trusted",
+            "VOIDR_EXECUTION_ID": "execution-trusted",
+        },
+        "clientParams": {
+            "LITELLM_API_KEY": "attacker-key",
+            "VOIDR_ORGANIZATION_ID": "org-attacker",
+            "VOIDR_EXECUTION_ID": "execution-attacker",
+        },
+    }
+    with pytest.raises(ServeExecutionError, match="override governed fields"):
+        api.consume_voice_envelope("execution-trusted", 1, "opaque-ref")
+
+
 def test_promote_params_skips_empty_values():
-    env = {"TWILIO_AUTH_TOKEN": "local"}
-    promoted = promote_params_to_environ({"TWILIO_AUTH_TOKEN": ""}, environ=env)
+    env = {"ECHO_CALL_MODE": "text"}
+    promoted = promote_params_to_environ({"ECHO_CALL_MODE": ""}, environ=env)
     assert promoted == []
-    assert env["TWILIO_AUTH_TOKEN"] == "local"
+    assert env["ECHO_CALL_MODE"] == "text"
+
+
+def test_customer_target_host_requires_service_allowlist():
+    env = {"ECHO_ALLOWED_TARGET_HOSTS": "mock.internal,*.safe.example"}
+    assert promote_params_to_environ(
+        {"ECHO_CALL_TARGET": "wss://tenant.safe.example/call"}, environ=env
+    ) == []
+    with pytest.raises(ServeExecutionError, match="not allowed"):
+        promote_params_to_environ(
+            {"ECHO_CALL_TARGET": "wss://exfil.attacker.invalid/collect"},
+            environ=env,
+        )
+
+
+def test_customer_cannot_inject_allowlist_to_enable_exfiltration():
+    with pytest.raises(ServeExecutionError, match="not allowed"):
+        promote_params_to_environ(
+            {
+                "ECHO_ALLOWED_TARGET_HOSTS": "attacker.invalid",
+                "ECHO_CALL_TARGET": "wss://attacker.invalid/collect",
+            },
+            environ={},
+        )
 
 
 def test_session_payload_records_overrides_and_source():
@@ -483,6 +592,55 @@ def test_get_persona_forwards_knowledge_level():
     assert calls[1] == "/echo/personas/dona-marcia?vocabulary=1&knowledgeLevel=baixa"
 
 
+def test_service_errors_never_include_remote_body(monkeypatch):
+    from voidr_echo_runner.service_mode import VoidrApi
+
+    secret_body = "token=remote-secret cpf=123.456.789-09 user@example.com"
+    api = VoidrApi("https://service.invalid", "access-secret")
+    api._client = httpx.Client(
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(400, text=secret_body)
+        )
+    )
+    with pytest.raises(ServeExecutionError) as error:
+        api.get_execution("execution")
+    rendered = str(error.value)
+    assert rendered == "service_http_400"
+    assert "remote-secret" not in rendered
+    assert "123.456.789-09" not in rendered
+    assert "user@example.com" not in rendered
+
+
+def test_put_shard_scrubs_environment_values_and_pii(monkeypatch):
+    from voidr_echo_runner.service_mode import VoidrApi
+
+    captured = {}
+    monkeypatch.setenv(
+        "ENVIRONMENT_PARAMS",
+        '{"CUSTOMER_SECRET":"sensitive-value","PHONE":"+5511999999999"}',
+    )
+    api = VoidrApi.__new__(VoidrApi)
+    api._request = (  # type: ignore[attr-defined]
+        lambda _method, _path, **kwargs: captured.update(kwargs["json"]) or {}
+    )
+    api.put_shard(
+        "execution",
+        1,
+        {
+            "status": "FAILED",
+            "errorMessage": (
+                "sensitive-value +5511999999999 user@example.com "
+                "Bearer abc.def.ghi"
+            ),
+        },
+    )
+    error = captured["errorMessage"]
+    assert "sensitive-value" not in error
+    assert "5511999999999" not in error
+    assert "user@example.com" not in error
+    assert "abc.def.ghi" not in error
+
+
 def test_persona_from_service_accepts_free_traits_string():
     # The service stores profile.freeTraits as a single "a; b" string (hive
     # contract); the runner model must coerce it into a list.
@@ -516,7 +674,7 @@ def test_persona_from_service_accepts_free_traits_string():
     ]
 
 
-def test_session_payload_omits_brain_when_unset():
+def test_session_payload_is_always_marked_ai_only():
     payload = build_session_payload(
         "exec-1",
         1,
@@ -526,4 +684,5 @@ def test_session_payload_omits_brain_when_unset():
         SessionVerdict(status="passed", deviations=[]),
         None,
     )
-    assert "brain" not in payload
+    assert payload["brain"] == "llm"
+    assert payload["runnerMode"] == "ai-only-v3"

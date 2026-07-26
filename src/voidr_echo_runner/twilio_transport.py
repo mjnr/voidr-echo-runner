@@ -38,6 +38,7 @@ import os
 import secrets
 import time
 from typing import Any
+from urllib.parse import urlsplit
 
 RECEIVE_POLL_S = 0.1
 STREAM_START_TIMEOUT_S = 60.0
@@ -94,6 +95,11 @@ class UtteranceSegmenter:
             self._reset()
             return utterance
         return None
+
+    @property
+    def speech_started(self) -> bool:
+        """Whether VAD has confirmed an active utterance."""
+        return self._in_speech
 
     def _process_frame(self, frame: bytes) -> bool:
         loud = audioop.rms(frame, 2) >= self.rms_threshold
@@ -159,6 +165,8 @@ class TwilioMediaStreamTransport:
         # gateway's public /twilio/{token} — no inbound connectivity to the
         # pod is ever needed.
         gateway_url = (os.environ.get("ECHO_MEDIA_GATEWAY_URL") or "").rstrip("/")
+        runtime = os.environ.get("ECHO_RUNTIME_ENV", "").strip().lower()
+        production = runtime in {"cloud", "staging", "prod", "production"}
         self.gateway_mode = bool(gateway_url)
         self._gateway_ws = None
         self._gateway_task: asyncio.Task | None = None
@@ -173,6 +181,20 @@ class TwilioMediaStreamTransport:
                 .replace("https://", "wss://")
                 .replace("http://", "ws://")
             )
+            if production and (
+                urlsplit(public_base).scheme != "wss"
+                or urlsplit(runner_base).scheme != "wss"
+            ):
+                raise RuntimeError(
+                    "production media gateway URLs must use HTTPS/WSS; "
+                    "HTTP/WS downgrade is forbidden"
+                )
+            gateway_token = os.environ.get("ECHO_MEDIA_GATEWAY_TOKEN", "").strip()
+            if not gateway_token or (production and len(gateway_token.encode()) < 32):
+                raise RuntimeError(
+                    "ECHO_MEDIA_GATEWAY_TOKEN is required in gateway mode "
+                    "and must be at least 32 bytes in production"
+                )
             self.public_url = f"{public_base}/twilio/{call_token}"
             self._gateway_runner_url = f"{runner_base}/runner/{call_token}"
         else:
@@ -185,6 +207,8 @@ class TwilioMediaStreamTransport:
                     "ECHO_MEDIA_GATEWAY_URL (media gateway mode, see gateway/README.md)."
                 )
             self.public_url = self.public_url.replace("https://", "wss://")
+            if production and urlsplit(self.public_url).scheme != "wss":
+                raise RuntimeError("production Twilio Media Streams URL must use WSS")
         self.listen_host = listen_host
         self.listen_port = listen_port
         self.send_digits = send_digits
@@ -206,6 +230,10 @@ class TwilioMediaStreamTransport:
         self._closed = False
         self._ended = False  # far side sent Media Streams `stop`
         self._expect_reconnect = False
+        self._audio_send_started: float | None = None
+        self._audio_sent_ms = 0.0
+        self._speech_active = False
+        self._speech_preroll = bytearray()
 
     @property
     def url(self) -> str:
@@ -220,9 +248,8 @@ class TwilioMediaStreamTransport:
             # Register the call on the media gateway BEFORE dialing: the
             # pairing must exist when Twilio's Media Stream connects.
             headers = {}
-            gw_token = os.environ.get("ECHO_MEDIA_GATEWAY_TOKEN")
-            if gw_token:
-                headers["Authorization"] = f"Bearer {gw_token}"
+            gw_token = os.environ.get("ECHO_MEDIA_GATEWAY_TOKEN", "").strip()
+            headers["Authorization"] = f"Bearer {gw_token}"
             self._gateway_ws = await websockets.connect(
                 self._gateway_runner_url, additional_headers=headers
             )
@@ -356,12 +383,50 @@ class TwilioMediaStreamTransport:
         elif kind == "media" and self._serializer is not None:
             frame = await self._serializer.deserialize(raw)
             if isinstance(frame, InputAudioRawFrame):
-                for utterance in self._segmenter.feed(frame.audio):
-                    self._push_utterance(utterance)
+                was_speaking = self._speech_active
+                if not was_speaking:
+                    self._speech_preroll.extend(frame.audio)
+                    preroll_bytes = int(
+                        PIPELINE_SAMPLE_RATE * VAD_MIN_SPEECH_MS / 1000
+                    ) * 2
+                    if len(self._speech_preroll) > preroll_bytes:
+                        del self._speech_preroll[:-preroll_bytes]
+                utterances = self._segmenter.feed(frame.audio)
+                if self._segmenter.speech_started and not self._speech_active:
+                    self._speech_active = True
+                    self._inbox.put_nowait(
+                        {"type": "event", "name": "speech_started", "speaker": "agent"}
+                    )
+                    self._inbox.put_nowait(
+                        {
+                            "type": "audio_start",
+                            "encoding": "pcm_s16le",
+                            "sample_rate": PIPELINE_SAMPLE_RATE,
+                            "channels": 1,
+                            "data": base64.b64encode(self._speech_preroll).decode("ascii"),
+                            "speaker": "agent",
+                        }
+                    )
+                    self._speech_preroll.clear()
+                elif was_speaking:
+                    self._inbox.put_nowait(
+                        {
+                            "type": "audio_chunk",
+                            "data": base64.b64encode(frame.audio).decode("ascii"),
+                        }
+                    )
+                for utterance in utterances:
+                    self._inbox.put_nowait({"type": "audio_end"})
+                    self._speech_active = False
+                    self._speech_preroll.clear()
         elif kind == "stop":
             tail = self._segmenter.flush()
             if tail:
-                self._push_utterance(tail)
+                if self._speech_active:
+                    self._inbox.put_nowait({"type": "audio_end"})
+                    self._speech_active = False
+                else:
+                    self._push_utterance(tail)
             if self._expect_reconnect:
                 # Old stream closing after a DTMF TwiML update; a new
                 # <Connect><Stream> connection is on its way.
@@ -408,20 +473,28 @@ class TwilioMediaStreamTransport:
         when the far side hangs up right after a terminal turn, the remaining
         audio is dropped and `receive()` reports the call end — a completed
         journey must not turn into a transport_error."""
+        if self._ws is None or self._serializer is None:
+            if self._closed or self._ended:
+                return  # call already over; drop the late utterance
+            raise RuntimeError("media stream is not connected")
+        await self.send_audio_chunk(pcm, sample_rate)
+        await self.finish_audio(sample_rate)
+
+    async def send_audio_chunk(
+        self, pcm: bytes, sample_rate: int = PIPELINE_SAMPLE_RATE
+    ) -> None:
+        """Send one progressively-produced PCM chunk without ending the utterance."""
         import websockets
 
         from pipecat.frames.frames import OutputAudioRawFrame
 
         if self._ws is None or self._serializer is None:
             if self._closed or self._ended:
-                return  # call already over; drop the late utterance
+                return
             raise RuntimeError("media stream is not connected")
-        # Trailing silence flushes the serializer's stream resampler (which
-        # buffers ~100ms) so the end of the utterance is not swallowed.
-        pcm = pcm + b"\x00" * int(sample_rate * 0.24) * 2
+        if self._audio_send_started is None:
+            self._audio_send_started = time.monotonic()
         chunk_bytes = int(sample_rate * OUT_CHUNK_MS / 1000) * 2
-        started = time.monotonic()
-        sent_ms = 0.0
         for i in range(0, len(pcm), chunk_bytes):
             frame = OutputAudioRawFrame(
                 audio=pcm[i : i + chunk_bytes],
@@ -434,11 +507,38 @@ class TwilioMediaStreamTransport:
                     await self._ws.send(payload)
                 except websockets.ConnectionClosed:
                     return  # line dropped mid-utterance; receive() drains the end
-            sent_ms += OUT_CHUNK_MS
+            self._audio_sent_ms += OUT_CHUNK_MS
             # Pace slightly faster than real time; Twilio buffers a little.
-            ahead_s = sent_ms / 1000 * 0.8 - (time.monotonic() - started)
+            ahead_s = (
+                self._audio_sent_ms / 1000 * 0.8
+                - (time.monotonic() - self._audio_send_started)
+            )
             if ahead_s > 0:
                 await asyncio.sleep(ahead_s)
+
+    async def finish_audio(self, sample_rate: int = PIPELINE_SAMPLE_RATE) -> None:
+        """Flush the serializer once after the final streamed TTS chunk."""
+        if self._audio_send_started is None:
+            return
+        try:
+            await self.send_audio_chunk(
+                b"\x00" * int(sample_rate * 0.24) * 2, sample_rate
+            )
+        finally:
+            self._audio_send_started = None
+            self._audio_sent_ms = 0.0
+
+    async def clear_audio(self) -> None:
+        """Discard Twilio's queued outbound audio immediately on barge-in."""
+        if self._ws is None or self.stream_sid is None:
+            return
+        try:
+            await self._ws.send(
+                json.dumps({"event": "clear", "streamSid": self.stream_sid})
+            )
+        finally:
+            self._audio_send_started = None
+            self._audio_sent_ms = 0.0
 
     async def send_dtmf(self, digits: str) -> None:
         """Mid-call DTMF via TwiML update: `<Play digits>` + re-`<Connect><Stream>`.

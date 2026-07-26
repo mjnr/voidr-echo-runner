@@ -28,10 +28,12 @@ import os
 import re
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -55,23 +57,118 @@ from .runner import CallResult, CallRunner
 from .transport import build_transport
 
 ENV_PLACEHOLDER = re.compile(r"\{\{\s*env\.([A-Za-z0-9_]+)\s*\}\}")
+_SENSITIVE_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"),
+    re.compile(r"(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b"),
+    re.compile(r"\b\d{3}\.?\d{3}\.?\d{3}-?\d{2}\b"),
+    re.compile(
+        r"(?<!\d)(?:\+?\d{10,15}|(?:\+?55[\s.-]?)?\(?\d{2}\)?"
+        r"[\s.-]?\d{4,5}[\s.-]?\d{4})(?!\d)"
+    ),
+    re.compile(r"(?i)\b(?:token|secret|password|authorization)\s*[:=]\s*\S+"),
+)
 
-# Prefixes of ENVIRONMENT_PARAMS keys promoted to os.environ before the call
-# pipeline is built. In the cloud the job env carries ONLY the Voidr contract
-# vars (VOIDR_*, EXECUTION_ID, ENVIRONMENT_PARAMS...) — every media/provider
-# secret (Twilio, Deepgram, ElevenLabs) and echo knob travels inside
-# ENVIRONMENT_PARAMS, but the transports/audio engines read os.environ
-# (twilio_transport.REQUIRED_ENV, PipecatAudioEngine, LLMBrain). Promotion
-# bridges the two: params are authoritative (they are the environment's
-# intent for THIS execution), os.environ keeps working as the local-dev
-# fallback when a key is absent from the params bag.
-PROMOTED_ENV_PREFIXES = ("HIVE_", "TWILIO_", "DEEPGRAM_", "ELEVENLABS_", "ECHO_")
+class ServeExecutionError(RuntimeError):
+    pass
+
+
+def _environment_sensitive_values() -> tuple[str, ...]:
+    try:
+        params = json.loads(os.environ.get("ENVIRONMENT_PARAMS", "{}") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        params = {}
+    values = [str(value) for value in params.values() if value not in (None, "")]
+    values.extend(
+        os.environ.get(name, "")
+        for name in (
+            "VOIDR_ACCESS_TOKEN",
+            "VOIDR_CLIENT_SECRET",
+            "HIVE_GATEWAY_TOKEN",
+            "VOICE_GATEWAY_TOKEN",
+        )
+    )
+    return tuple(value for value in values if len(value) >= 3)
+
+
+def scrub_sensitive(value: object) -> str:
+    """Early-safe scrubber for every managed-mode log/error boundary."""
+    text = str(value)
+    for secret in sorted(_environment_sensitive_values(), key=len, reverse=True):
+        text = text.replace(secret, "[REDACTED]")
+    for pattern in _SENSITIVE_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text[:500]
+
+
+def _safe_log(message: object, *, stderr: bool = False) -> None:
+    print(scrub_sensitive(message), file=sys.stderr if stderr else sys.stdout)
+
+
+def _safe_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        return scrub_sensitive(value)
+    if isinstance(value, dict):
+        return {str(key): _safe_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_safe_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_safe_payload(item) for item in value)
+    return value
+
+
+# ENVIRONMENT_PARAMS is customer-controlled execution data. Platform
+# coordinates and credentials are injected as container environment variables
+# by the service and must never be shadowed by this bag.
+CLIENT_PROMOTED_ENV_KEYS = {
+    "ECHO_CALL_MODE",
+    "ECHO_HUMAN_REALISM",
+    "ECHO_HUMAN_TIMING",
+    "ECHO_CALL_AMBIENCE",
+    "ECHO_LIVE",
+    "ECHO_LIVE_AUDIO",
+}
+CLIENT_ENDPOINT_KEYS = {"ECHO_CALL_TARGET"}
+PLATFORM_HOST_ALLOWLIST_ENV = "ECHO_ALLOWED_TARGET_HOSTS"
+TRUSTED_ENVELOPE_ENV_KEYS = {
+    "LITELLM_API_KEY",
+    "LITELLM_BASE_URL",
+    "LITELLM_TTS_MODEL",
+    "LITELLM_STT_MODEL",
+    "LITELLM_STREAMING_STT_URL",
+    "HIVE_ECHO_PERSONA_V3_MODEL_REVISION",
+    "VOIDR_ORGANIZATION_ID",
+    "VOIDR_EXECUTION_ID",
+}
+
+
+def _host_allowed(host: str, allowlist: set[str]) -> bool:
+    host = host.rstrip(".").lower()
+    return any(
+        host == entry
+        or (entry.startswith("*.") and host.endswith(entry[1:]) and host != entry[2:])
+        for entry in allowlist
+    )
+
+
+def _validate_client_endpoint(key: str, value: str, env: dict[str, str]) -> None:
+    if key != "ECHO_CALL_TARGET" or value.startswith(("tel:", "+")):
+        return
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"ws", "wss", "http", "https"} or not parsed.hostname:
+        raise ServeExecutionError(f"{key} must be an absolute ws(s)/http(s) URL or tel target")
+    allowlist = {
+        item.strip().rstrip(".").lower()
+        for item in env.get(PLATFORM_HOST_ALLOWLIST_ENV, "").split(",")
+        if item.strip()
+    }
+    if not allowlist or not _host_allowed(parsed.hostname, allowlist):
+        raise ServeExecutionError(f"{key} host is not allowed by the service")
 
 
 def promote_params_to_environ(
     params: dict[str, str], environ: dict[str, str] | None = None
 ) -> list[str]:
-    """Promotes media/provider keys from ENVIRONMENT_PARAMS to the process env.
+    """Promote the small customer-setting allowlist to the process environment.
 
     Returns the promoted key names (values never logged). Empty-string values
     are skipped — an empty secret must not shadow a locally exported one.
@@ -79,7 +176,29 @@ def promote_params_to_environ(
     env = os.environ if environ is None else environ
     promoted: list[str] = []
     for key, value in params.items():
-        if key.startswith(PROMOTED_ENV_PREFIXES) and value:
+        if key in CLIENT_ENDPOINT_KEYS and value:
+            _validate_client_endpoint(key, value, env)
+        if key in CLIENT_PROMOTED_ENV_KEYS and value:
+            env[key] = value
+            promoted.append(key)
+    return sorted(promoted)
+
+
+def promote_trusted_envelope_to_environ(
+    trusted: dict[str, str], environ: dict[str, str] | None = None
+) -> list[str]:
+    """Install service-authenticated credentials and scope into the engine.
+
+    Unknown fields fail closed. Client params never pass through this function,
+    so they cannot inject a virtual key or overwrite tenant/execution scope.
+    """
+    unknown = set(trusted) - TRUSTED_ENVELOPE_ENV_KEYS
+    if unknown:
+        raise ServeExecutionError("VOICE execution envelope returned unknown trusted fields")
+    env = os.environ if environ is None else environ
+    promoted: list[str] = []
+    for key, value in trusted.items():
+        if value:
             env[key] = value
             promoted.append(key)
     return sorted(promoted)
@@ -91,10 +210,6 @@ FLAG_ABANDONMENT = "flag:abandono"
 FLAG_MUST_NOT_VISIT = "flag:must_not_visit"
 FLAG_MISSING_MUST_VISIT = "flag:must_visit_missing"
 FLAG_MAX_TURNS = "flag:max_turns_exceeded"
-
-
-class ServeExecutionError(RuntimeError):
-    pass
 
 
 def _iso_now() -> str:
@@ -134,46 +249,46 @@ class VoidrApi:
 
     @classmethod
     def authenticate(cls, base_url: str, client_id: str, client_secret: str) -> str:
-        resp = httpx.post(
-            f"{base_url.rstrip('/')}/v1/service-accounts/token",
-            json={
-                "grantType": "client_credentials",
-                "clientId": client_id,
-                "clientSecret": client_secret,
-            },
-            timeout=30.0,
-        )
-        if resp.status_code != 201 and resp.status_code != 200:
-            raise ServeExecutionError(
-                f"token exchange failed: HTTP {resp.status_code}: {resp.text[:300]}"
+        try:
+            resp = httpx.post(
+                f"{base_url.rstrip('/')}/v1/service-accounts/token",
+                json={
+                    "grantType": "client_credentials",
+                    "clientId": client_id,
+                    "clientSecret": client_secret,
+                },
+                timeout=30.0,
             )
-        return resp.json()["access_token"]
+        except httpx.HTTPError:
+            raise ServeExecutionError("service_auth_failed") from None
+        if resp.status_code != 201 and resp.status_code != 200:
+            raise ServeExecutionError(f"service_auth_http_{resp.status_code}")
+        try:
+            token = resp.json()["access_token"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            raise ServeExecutionError("service_auth_invalid_response") from None
+        if not isinstance(token, str) or not token:
+            raise ServeExecutionError("service_auth_invalid_response")
+        return token
 
     def _request(self, method: str, path: str, retries: int = 3, **kwargs) -> Any:
         url = f"{self.base_url}/v1{path}"
-        last_error: Exception | None = None
         for attempt in range(retries):
             try:
                 resp = self._client.request(method, url, **kwargs)
                 if resp.status_code >= 500:
-                    raise ServeExecutionError(
-                        f"{method} {path} → HTTP {resp.status_code}: {resp.text[:300]}"
-                    )
+                    raise ServeExecutionError(f"service_http_{resp.status_code}")
                 if resp.status_code >= 400:
-                    # 4xx is not retryable — fail loudly with the body.
-                    raise ServeExecutionError(
-                        f"{method} {path} → HTTP {resp.status_code}: {resp.text[:500]}"
-                    ) from None
+                    raise ServeExecutionError(f"service_http_{resp.status_code}") from None
                 body = resp.json()
                 return body.get("data", body) if isinstance(body, dict) else body
             except ServeExecutionError as exc:
-                if "HTTP 4" in str(exc):
+                if str(exc).startswith("service_http_4"):
                     raise
-                last_error = exc
-            except (httpx.TransportError, json.JSONDecodeError) as exc:
-                last_error = exc
+            except (httpx.TransportError, json.JSONDecodeError):
+                pass
             time.sleep(1.5 * (attempt + 1))
-        raise ServeExecutionError(f"{method} {path} failed after {retries} attempts: {last_error}")
+        raise ServeExecutionError("service_request_failed") from None
 
     def get_execution(self, execution_id: str) -> dict:
         return self._request("GET", f"/executions/{execution_id}")
@@ -197,10 +312,36 @@ class VoidrApi:
         return self._request("GET", f"/echo/personas/{persona_id}{query}")
 
     def put_shard(self, execution_id: str, index: int, payload: dict) -> dict:
-        return self._request("PUT", f"/executions/{execution_id}/shards/{index}", json=payload)
+        return self._request(
+            "PUT",
+            f"/executions/{execution_id}/shards/{index}",
+            json=_safe_payload(payload),
+        )
 
     def post_session(self, payload: dict) -> dict:
         return self._request("POST", "/echo/sessions", json=payload)
+
+    def consume_voice_envelope(
+        self, execution_id: str, shard_index: int, reference: str
+    ) -> tuple[dict[str, str], dict[str, str]]:
+        body = self._request(
+            "POST",
+            f"/executions/{execution_id}/shards/{shard_index}/voice-envelope/{reference}/consume",
+        )
+        trusted = body.get("trustedEnv") if isinstance(body, dict) else None
+        client = body.get("clientParams") if isinstance(body, dict) else None
+        valid = lambda value: isinstance(value, dict) and all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in value.items()
+        )
+        if not valid(trusted) or not valid(client):
+            raise ServeExecutionError("VOICE execution envelope returned invalid fields")
+        forbidden = set(client) & TRUSTED_ENVELOPE_ENV_KEYS
+        if forbidden:
+            raise ServeExecutionError(
+                "VOICE client params attempted to override governed fields"
+            )
+        return trusted, client
 
     def upload_file(self, key: str, content: bytes, content_type: str) -> str:
         presigned = self._request(
@@ -210,11 +351,12 @@ class VoidrApi:
         )
         upload_url = presigned["uploadUrl"]
         headers = {"Content-Type": content_type, **(presigned.get("headers") or {})}
-        put = httpx.put(upload_url, content=content, headers=headers, timeout=60.0)
+        try:
+            put = httpx.put(upload_url, content=content, headers=headers, timeout=60.0)
+        except httpx.HTTPError:
+            raise ServeExecutionError("artifact_upload_failed") from None
         if put.status_code >= 300:
-            raise ServeExecutionError(
-                f"signed-URL upload of {key} failed: HTTP {put.status_code}: {put.text[:300]}"
-            )
+            raise ServeExecutionError(f"artifact_upload_http_{put.status_code}")
         return key
 
 
@@ -440,6 +582,19 @@ def classify_session(
             visited.append(state)
     deviations: list[dict] = []
 
+    if call.failure_status:
+        return SessionVerdict(
+            # Keep the established service enum stable. The precise AI
+            # classification remains observable in the failure timeline event.
+            status="env_failure",
+            deviations=[
+                {
+                    "rule": "hive_turn_failure",
+                    "detail": call.transport_error or "Hive persona-turn failed",
+                }
+            ],
+        )
+
     if call.transport_error and call.agent_turns == 0:
         return SessionVerdict(
             status="env_failure",
@@ -558,8 +713,8 @@ def resolve_persona_plan_entry(
         return None
     try:
         plan = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        print(f"  ECHO_PERSONA_PLAN inválido (ignorando): {exc}", file=sys.stderr)
+    except json.JSONDecodeError:
+        _safe_log("ECHO_PERSONA_PLAN inválido; ignorado", stderr=True)
         return None
     if not isinstance(plan, list) or shard_index < 1 or shard_index > len(plan):
         return None
@@ -586,15 +741,36 @@ def build_session_payload(
     def rel(ts: int) -> int:
         return max(0, int(ts) - start)
 
-    transcript = [
-        {
+    def persisted_provenance(entry: dict[str, Any]) -> dict[str, Any]:
+        """Translate the validated Hive turn into the service session DTO."""
+        provenance = entry.get("provenance")
+        trace = provenance.get("trace") if isinstance(provenance, dict) else None
+        if not isinstance(provenance, dict) or not isinstance(trace, dict):
+            raise ValueError("tester turn is missing validated Hive provenance/trace")
+        for key in ("traceId", "promptHash"):
+            if not isinstance(trace.get(key), str) or not trace[key]:
+                raise ValueError(f"tester turn provenance trace is missing {key}")
+        return {
+            "source": provenance["source"],
+            "turnId": provenance["turnId"],
+            "promptVersion": provenance["promptVersion"],
+            "modelResolved": provenance["modelResolved"],
+            "modelVersion": provenance["modelVersion"],
+            "policyVersion": provenance["policyVersion"],
+            "trace": dict(trace),
+        }
+
+    transcript = []
+    for entry in call.transcript:
+        item = {
             # Session schema is diarized tester|agent — URA prompts are far-side.
             "role": "tester" if entry["speaker"] == "tester" else "agent",
             "text": entry["text"],
             "tsMs": rel(entry["ts"]),
         }
-        for entry in call.transcript
-    ]
+        if "provenance" in entry:
+            item["provenance"] = persisted_provenance(entry)
+        transcript.append(item)
     timeline = [
         {
             "type": event["type"],
@@ -607,6 +783,8 @@ def build_session_payload(
         "executionId": execution_id,
         "shardIndex": shard_index,
         "caseSlug": case_slug,
+        "runnerMode": "ai-only-v3",
+        "brain": "llm",
         "channel": voice_config.get("channel", "voice"),
         "status": verdict.status,
         "trajectory": [t.state for t in call.trajectory],
@@ -615,10 +793,12 @@ def build_session_payload(
         "metrics": {"turns": call.agent_turns, "durationMs": call.duration_ms},
         "deviations": verdict.deviations,
     }
-    # Which brain produced the tester turns — `llm` triggers the service's
-    # persona-fidelity judge on this session (P0.4).
-    if brain:
-        payload["brain"] = brain
+    # The current service DTO has no aiOutcome field. Detailed Hive failure
+    # classification remains in the accepted timeline event until the service
+    # integration adds a first-class field; do not emit schema-incompatible
+    # top-level states in the meantime.
+    # `brain` is retained in the signature for report compatibility, but the
+    # runtime is AI-only and every session must be judged as Hive-authored.
     # Canonical Journey (module) slug from the case — when absent the service
     # derives it from the execution's plan (fallback), so we simply omit it.
     if module_slug:
@@ -643,6 +823,11 @@ def build_session_payload(
     return payload
 
 
+def persist_voice_session(api: VoidrApi, payload: dict[str, Any]) -> dict:
+    """Persist the mandatory audit record; transport/schema errors propagate."""
+    return api.post_session(payload)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Orchestration
 # ─────────────────────────────────────────────────────────────────────────────
@@ -653,9 +838,9 @@ def serve_execution(out_dir: Path) -> int:
     execution_id = os.environ.get("EXECUTION_ID")
     org_id = os.environ.get("VOIDR_ORG_ID")
     if not api_url or not execution_id or not org_id:
-        print(
+        _safe_log(
             "echo-runner serve-execution: VOIDR_API_URL, EXECUTION_ID and VOIDR_ORG_ID are required",
-            file=sys.stderr,
+            stderr=True,
         )
         return 2
 
@@ -663,34 +848,51 @@ def serve_execution(out_dir: Path) -> int:
     shard_total = int(os.environ.get("SHARDS_TOTAL", "1"))
     params: dict[str, str] = json.loads(os.environ.get("ENVIRONMENT_PARAMS", "{}") or "{}")
 
-    # ENVIRONMENT_PARAMS is authoritative job config: media/provider secrets
-    # (TWILIO_*, DEEPGRAM_*, ELEVENLABS_*), echo knobs (ECHO_*) and the hive
-    # endpoint (HIVE_*) are promoted to os.environ before the pipeline is
-    # built — in the cloud the pod env carries only the Voidr contract vars,
-    # so without promotion the transports/audio engines would see nothing.
-    # os.environ stays as local-dev fallback for keys absent from the bag.
-    promoted = promote_params_to_environ(params)
-    if promoted:
-        print(f"  env params promovidos para o processo: {', '.join(promoted)}")
-
     token = os.environ.get("VOIDR_ACCESS_TOKEN")
     if not token:
         client_id = os.environ.get("VOIDR_CLIENT_ID")
         client_secret = os.environ.get("VOIDR_CLIENT_SECRET")
         if not client_id or not client_secret:
-            print(
+            _safe_log(
                 "echo-runner serve-execution: set VOIDR_ACCESS_TOKEN or "
                 "VOIDR_CLIENT_ID + VOIDR_CLIENT_SECRET",
-                file=sys.stderr,
+                stderr=True,
             )
             return 2
         token = VoidrApi.authenticate(api_url, client_id, client_secret)
     api = VoidrApi(api_url, token)
-
-    print(
-        f"▶ serve-execution execution={execution_id} shard={shard_index}/{shard_total} "
-        f"org={org_id} api={api_url}"
+    envelope_ref = os.environ.get("VOICE_EXECUTION_ENVELOPE_REF", "").strip()
+    if not envelope_ref:
+        _safe_log(
+            "echo-runner serve-execution: VOICE_EXECUTION_ENVELOPE_REF is required",
+            stderr=True,
+        )
+        return 2
+    trusted_env, envelope_client_params = api.consume_voice_envelope(
+        execution_id, shard_index, envelope_ref
     )
+    # The authenticated envelope has two explicit trust domains. Governed
+    # credentials/scope go directly to the engine environment; customer
+    # settings remain params and cannot shadow any governed field.
+    promoted_trusted = promote_trusted_envelope_to_environ(trusted_env)
+    params.update(envelope_client_params)
+    promoted = promote_params_to_environ(params)
+    if promoted_trusted:
+        _safe_log(f"managed credentials promoted: {len(promoted_trusted)}")
+    if promoted:
+        _safe_log(f"managed settings promoted: {len(promoted)}")
+    if (
+        params.get("ECHO_KEEP_RAW_AUDIO") == "1"
+        or os.environ.get("ECHO_KEEP_RAW_AUDIO") == "1"
+    ):
+        _safe_log(
+            "echo-runner serve-execution: ECHO_KEEP_RAW_AUDIO=1 is forbidden "
+            "in managed execution mode",
+            stderr=True,
+        )
+        return 2
+
+    _safe_log(f"serve-execution started shard={shard_index}/{shard_total}")
 
     started_at = _iso_now()
     try:
@@ -758,6 +960,7 @@ def serve_execution(out_dir: Path) -> int:
         case, call_target = build_case(
             target, case_doc, persona.id, flow, params, plan_id, massa=massa
         )
+        _validate_client_endpoint("ECHO_CALL_TARGET", call_target, os.environ)
         seed = voice_config.get("seed") or 0
         if massa:
             case.massa = dict(massa.values)
@@ -770,7 +973,7 @@ def serve_execution(out_dir: Path) -> int:
             shard_index,
             {"status": "RUNNING", "startedAt": started_at},
         )
-        print(
+        _safe_log(
             f"  case={case.id} persona={persona.id} seed={seed} flow={flow.id} "
             f"target={redaction.redact(call_target)}"
         )
@@ -789,28 +992,17 @@ def serve_execution(out_dir: Path) -> int:
         from .emotional import EmotionalStateMachine
 
         emotional = EmotionalStateMachine.for_persona(persona, seed=seed)
-        # Persona brain: default is LLM (hive persona-turn) whenever the hive
-        # is reachable — EXECUTIONS MUST RUN THE SAME RICH PERSONA AS THE
-        # PLAYGROUND (founder report: execution felt "pragmatic" because it
-        # silently fell back to the scripted brain). ECHO_BRAIN=scripted still
-        # forces the deterministic brain; without hive credentials we fall
-        # back to scripted LOUDLY.
-        hive_available = bool(
-            os.environ.get("HIVE_URL") and os.environ.get("HIVE_GATEWAY_TOKEN")
-        )
-        brain_kind = (
-            (params.get("ECHO_BRAIN") or ("llm" if hive_available else "scripted"))
-            .strip()
-            .lower()
-        )
-        if brain_kind not in ("scripted", "llm"):
-            raise ServeExecutionError(f"invalid ECHO_BRAIN {brain_kind!r} (scripted|llm)")
-        if brain_kind == "scripted" and not params.get("ECHO_BRAIN"):
-            print(
-                "  ⚠ hive indisponível (HIVE_URL/HIVE_GATEWAY_TOKEN ausentes) — "
-                "caindo para o brain SCRIPTED: a persona NÃO terá o condicionamento "
-                "rico do playground nesta execução",
-                file=sys.stderr,
+        # AI-only v3: Hive is a hard dependency. Missing credentials fail the
+        # shard before transport/audio creation, so no tester turn or TTS can
+        # be produced accidentally.
+        missing_hive = [
+            name
+            for name in ("HIVE_URL", "HIVE_GATEWAY_TOKEN", "VOIDR_ORG_ID")
+            if not os.environ.get(name)
+        ]
+        if missing_hive:
+            raise ServeExecutionError(
+                f"Hive persona-turn v3 is required; missing: {', '.join(missing_hive)}"
             )
         # EXEC-REALISM: memory imperfection + humanized timing (default ON;
         # ECHO_HUMAN_REALISM=0 disables everything, ECHO_HUMAN_TIMING=0 keeps
@@ -823,17 +1015,25 @@ def serve_execution(out_dir: Path) -> int:
                 massa,
                 timing_enabled=(params.get("ECHO_HUMAN_TIMING") or "1") != "0",
             )
-        brain = build_brain(brain_kind, persona, case.goal, seed)
-        if brain_kind == "llm":
-            brain.redaction = redaction  # deny-list of the case massa
-            brain.emotional = emotional  # structured emotionalState per turn
-            if massa:
-                # Personal-data card: labels + {{massa.*}} placeholders only —
-                # values are substituted runner-side (humanizer.finalize_reply).
-                brain.personal_data = massa.personal_data_lines()
-            if persona_overrides_record:
-                # Prompt-visible variation block (adherence is judge-verified).
-                brain.execution_overrides = overrides
+        conversation_id = str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"voidr:echo:{execution_id}:shard:{shard_index}",
+            )
+        )
+        brain = build_brain(
+            persona,
+            case.goal,
+            seed,
+            conversation_id=conversation_id,
+        )
+        brain.redaction = redaction  # deny-list of the case massa
+        brain.emotional = emotional  # structured emotionalState per turn
+        if massa:
+            # Labels + placeholders only; clear values never reach Hive.
+            brain.personal_data = massa.personal_data_lines()
+        if persona_overrides_record:
+            brain.execution_overrides = overrides
         send_digits = None
         if is_pstn and case.dial_plan.dtmf_steps:
             # IVR digits at answer time, with `w` (0.5s) pauses between steps.
@@ -862,9 +1062,9 @@ def serve_execution(out_dir: Path) -> int:
             )
             receive_timeout = 45.0  # remote STT+TTS per turn
 
-        # Live events (plan Feature 1): default ON in serve-execution —
-        # ECHO_LIVE=0 (param or env) opts out; ECHO_LIVE_AUDIO=0 keeps the
-        # semantic events but suppresses turn_audio (real sensitive massas).
+        # Live events (plan Feature 1): default ON in serve-execution.
+        # Text receives full PII + deny-list redaction; paired sensitive audio
+        # is silenced before publication.
         live = None
         if (params.get("ECHO_LIVE") or os.environ.get("ECHO_LIVE") or "1") != "0":
             from .live_events import LivePublisher
@@ -874,7 +1074,8 @@ def serve_execution(out_dir: Path) -> int:
                 execution_id,
                 shard_index,
                 token=token,
-                redact=redaction.redact_deny,
+                redact=redaction.redact,
+                has_sensitive_data=lambda text: bool(redaction.find_spans(text)),
                 audio_enabled=(
                     params.get("ECHO_LIVE_AUDIO") or os.environ.get("ECHO_LIVE_AUDIO") or "1"
                 )
@@ -939,7 +1140,8 @@ def serve_execution(out_dir: Path) -> int:
             **({"testPlanId": case.test_plan_id} if case.test_plan_id else {}),
             "runnerVersion": __version__,
             "mode": mode,
-            "brain": brain_kind,
+            "brain": "hive-llm",
+            "conversationId": conversation_id,
             "target": redaction.redact(call_target),
             "executionId": execution_id,
             "shard": {"index": shard_index, "total": shard_total},
@@ -955,8 +1157,10 @@ def serve_execution(out_dir: Path) -> int:
         wav_path: Path | None = None
         if mode == "audio" and recorder is not None:
             meta["audio"] = {
-                "sttProvider": "deepgram",
-                "ttsProvider": "elevenlabs",
+                "sttProvider": "litellm",
+                "ttsProvider": "litellm",
+                "sttModel": os.environ.get("LITELLM_STT_MODEL", ""),
+                "ttsModel": os.environ.get("LITELLM_TTS_MODEL", ""),
                 "voiceId": persona.speech.voiceId,
                 "sttTurns": transport.stt_turns,
                 "ttsTurns": transport.tts_turns,
@@ -1005,32 +1209,31 @@ def serve_execution(out_dir: Path) -> int:
                     wav_path.read_bytes(),
                     "audio/wav",
                 )
-            print(f"  artifacts uploaded under {shard_prefix}/")
-        except Exception as upload_error:  # noqa: BLE001 — report shard even if upload fails
-            print(f"  artifact upload failed (continuing): {upload_error}", file=sys.stderr)
+            _safe_log("artifacts uploaded")
+        except Exception:  # noqa: BLE001 — report shard even if upload fails
+            _safe_log("artifact_upload_failed; continuing", stderr=True)
 
-        # Voice session first (best effort), then the shard PUT that can
-        # trigger execution finalization.
-        try:
-            session = api.post_session(
-                build_session_payload(
-                    execution_id,
-                    shard_index,
-                    case.id,
-                    voice_config,
-                    call,
-                    verdict,
-                    transcript_key,
-                    module_slug=case.module_slug,
-                    audio_path=audio_key,
-                    brain=brain_kind,
-                    persona_overrides=persona_overrides_record or None,
-                    persona_source=persona_source,
-                )
+        # Persist the voice session before the shard PUT that can trigger
+        # execution finalization. A rejected/lost session is a shard failure,
+        # never a silently successful execution without its audit record.
+        persist_voice_session(
+            api,
+            build_session_payload(
+                execution_id,
+                shard_index,
+                case.id,
+                voice_config,
+                call,
+                verdict,
+                transcript_key,
+                module_slug=case.module_slug,
+                audio_path=audio_key,
+                brain="llm",
+                persona_overrides=persona_overrides_record or None,
+                persona_source=persona_source,
             )
-            print(f"  voice session recorded: {session.get('_id', '?')} status={verdict.status}")
-        except Exception as session_error:  # noqa: BLE001
-            print(f"  voice session POST failed (continuing): {session_error}", file=sys.stderr)
+        )
+        _safe_log(f"voice session recorded status={verdict.status}")
 
         report = json.loads(report_path.read_text())
         api.put_shard(
@@ -1041,27 +1244,31 @@ def serve_execution(out_dir: Path) -> int:
                 "startedAt": started_at,
                 "finishedAt": _iso_now(),
                 "durationMs": call.duration_ms,
+                **(
+                    {"cloudJobId": os.environ["CLOUD_JOB_ID"]}
+                    if os.environ.get("CLOUD_JOB_ID")
+                    else {}
+                ),
                 "stats": report["stats"],
                 "results": [
                     {
                         "name": r["name"],
                         "status": r["status"] if r["status"] in ("passed", "failed", "skipped") else "failed",
                         "durationMs": r.get("durationMs", 0),
-                        **({"errorMessage": r["errorMessage"]} if r.get("errorMessage") else {}),
+                        **({"errorMessage": "test_failed"} if r.get("errorMessage") else {}),
                     }
                     for r in report["results"]
                 ],
             },
         )
-        trajectory = " -> ".join(t.state for t in call.trajectory) or "(vazia)"
-        print(f"  trajetória: {trajectory}")
-        print(f"  resultado: {evaluation.status.upper()}  sessão: {verdict.status}")
+        _safe_log(f"trajectory states={len(call.trajectory)}")
+        _safe_log(f"result={evaluation.status.upper()} session={verdict.status}")
         if evaluation.error_message:
-            print(f"  motivo: {evaluation.error_message}")
-        print(f"  shard {shard_index}/{shard_total} FINISHED reportado")
+            _safe_log("evaluation_failed")
+        _safe_log(f"shard {shard_index}/{shard_total} FINISHED reported")
         return 0
-    except Exception as exc:  # noqa: BLE001 — report infra failure to the service
-        print(f"echo-runner serve-execution: FAILED: {exc}", file=sys.stderr)
+    except Exception:  # noqa: BLE001 — report infra failure to the service
+        _safe_log("echo-runner serve-execution: FAILED runner_execution_failed", stderr=True)
         try:
             api.put_shard(
                 execution_id,
@@ -1070,9 +1277,14 @@ def serve_execution(out_dir: Path) -> int:
                     "status": "FAILED",
                     "startedAt": started_at,
                     "finishedAt": _iso_now(),
-                    "errorMessage": str(exc)[:2000],
+                    **(
+                        {"cloudJobId": os.environ["CLOUD_JOB_ID"]}
+                        if os.environ.get("CLOUD_JOB_ID")
+                        else {}
+                    ),
+                    "errorMessage": "runner_execution_failed",
                 },
             )
-        except Exception as report_error:  # noqa: BLE001
-            print(f"failed to report shard FAILED: {report_error}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            _safe_log("failed_to_report_shard", stderr=True)
         return 1

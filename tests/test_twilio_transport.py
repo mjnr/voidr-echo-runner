@@ -194,6 +194,12 @@ def test_send_audio_before_connect_still_raises(twilio_env):
         asyncio.run(transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 100)))
 
 
+def test_finish_audio_is_idempotent_when_no_stream_is_active(twilio_env):
+    transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+    asyncio.run(transport.finish_audio())
+    asyncio.run(transport.finish_audio())
+
+
 # --- Full connect + media stream round trip ------------------------------------
 
 
@@ -253,12 +259,21 @@ def test_connect_media_roundtrip(twilio_env, monkeypatch):
     async def scenario():
         twilio_task = asyncio.create_task(fake_twilio_side())
         await transport.connect()
+        speech_started = await transport.receive(timeout=10.0)
+        assert speech_started["name"] == "speech_started"
         msg = await transport.receive(timeout=10.0)
-        assert msg["type"] == "audio"
-        pcm = base64.b64decode(msg["data"])
+        assert msg["type"] == "audio_start"
+        pcm = bytearray(base64.b64decode(msg["data"]))
         assert msg["sample_rate"] == PIPELINE_SAMPLE_RATE
+        while True:
+            chunk = await transport.receive(timeout=10.0)
+            if chunk["type"] == "audio_end":
+                break
+            assert chunk["type"] == "audio_chunk"
+            pcm.extend(base64.b64decode(chunk["data"]))
         assert len(pcm) > TWILIO_SAMPLE_RATE  # >0.5s once upsampled to 16kHz
         await transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 600))
+        await transport.clear_audio()
         ended = await transport.receive(timeout=10.0)
         assert ended == {"type": "event", "name": "call_ended", "reason": "completed"}
         await twilio_task
@@ -276,6 +291,7 @@ def test_connect_media_roundtrip(twilio_env, monkeypatch):
 
     media_out = [m for m in received_by_twilio if m.get("event") == "media"]
     assert media_out, "runner sent no outbound media frames"
+    assert {"event": "clear", "streamSid": "MZ_stream_1"} in received_by_twilio
     assert all(m["streamSid"] == "MZ_stream_1" for m in media_out)
     # 600ms PCM @16kHz + ~240ms flush padding -> ~840ms mu-law @8kHz, minus
     # up to ~100ms retained inside the stream resampler.
@@ -316,9 +332,25 @@ def test_gateway_mode_builds_capability_urls(gateway_env):
 def test_gateway_mode_does_not_require_stream_public_url(twilio_env, monkeypatch):
     monkeypatch.delenv("TWILIO_STREAM_PUBLIC_URL")
     monkeypatch.setenv("ECHO_MEDIA_GATEWAY_URL", "wss://media-gw.example")
+    monkeypatch.setenv("ECHO_MEDIA_GATEWAY_TOKEN", "gw-secret")
     transport = TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
     # sem ECHO_MEDIA_GATEWAY_RUNNER_URL, o registro usa a mesma base pública
     assert transport._gateway_runner_url.startswith("wss://media-gw.example/runner/")
+
+
+def test_production_gateway_rejects_ws_runner_downgrade(gateway_env, monkeypatch):
+    monkeypatch.setenv("ECHO_RUNTIME_ENV", "production")
+    with pytest.raises(RuntimeError, match="downgrade"):
+        TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
+
+
+def test_gateway_mode_rejects_empty_auth_token(twilio_env, monkeypatch):
+    monkeypatch.setenv("ECHO_RUNTIME_ENV", "production")
+    monkeypatch.setenv("ECHO_MEDIA_GATEWAY_URL", "wss://media-gw.example")
+    monkeypatch.delenv("ECHO_MEDIA_GATEWAY_RUNNER_URL", raising=False)
+    monkeypatch.setenv("ECHO_MEDIA_GATEWAY_TOKEN", " ")
+    with pytest.raises(RuntimeError, match="ECHO_MEDIA_GATEWAY_TOKEN"):
+        TwilioMediaStreamTransport("+5511999999999", client=FakeTwilioClient())
 
 
 def test_gateway_mode_full_roundtrip(gateway_env):
@@ -368,9 +400,12 @@ def test_gateway_mode_full_roundtrip(gateway_env):
             driver = asyncio.create_task(drive_call())
             await transport.connect()
             ws = await driver
+            assert (await transport.receive(timeout=10.0))["name"] == "speech_started"
             msg = await transport.receive(timeout=10.0)
-            assert msg["type"] == "audio"
+            assert msg["type"] == "audio_start"
             assert msg["sample_rate"] == PIPELINE_SAMPLE_RATE
+            while (await transport.receive(timeout=10.0))["type"] != "audio_end":
+                pass
 
             await transport.send_audio(tone_pcm(PIPELINE_SAMPLE_RATE, 300))
             await asyncio.sleep(0.3)  # deixa os frames outbound chegarem

@@ -1,7 +1,7 @@
 """Audio conversation mode — real Pipecat pipelines.
 
-STT: DeepgramSTTService (streaming websocket, language=pt-BR).
-TTS: ElevenLabsHttpTTSService (eleven_flash_v2_5, PCM 16 kHz).
+Production STT/TTS uses the org-scoped LiteLLM virtual key. Direct provider
+Pipecat adapters exist only behind explicit local/test opt-in.
 
 The conversation over the local WebSocket protocol is turn-based (one complete
 utterance per `audio` message), so each turn runs a short-lived real Pipecat
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import os
 import wave
 from dataclasses import dataclass
@@ -40,6 +41,8 @@ from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService
 from pipecat.transcriptions.language import Language
 from pipecat.workers.runner import WorkerRunner
 
+from .voice_gateway import VoiceGatewayAudioEngine, resolve_voice_config
+
 SAMPLE_RATE = 16000
 STT_TIMEOUT_S = 25.0
 STT_EXTRA_DRAIN_S = 1.0
@@ -59,18 +62,19 @@ class AudioServices:
 
 def resolve_audio_services() -> AudioServices:
     """Validate env-var gated providers, failing with actionable guidance."""
+    config = resolve_voice_config()
+    if not config.direct:
+        return AudioServices(
+            stt_provider=f"litellm/{config.stt_alias}",
+            tts_provider=f"litellm/{config.tts_alias}",
+        )
     if not os.environ.get("DEEPGRAM_API_KEY"):
         raise RuntimeError(
-            "Audio mode requires DEEPGRAM_API_KEY (STT, pt-BR streaming). "
-            "None is set — run with --mode text for offline execution."
+            "Direct local audio mode requires DEEPGRAM_API_KEY. Prefer "
+            "VOICE_GATEWAY_URL + VOICE_GATEWAY_TOKEN."
         )
     if os.environ.get("ELEVENLABS_API_KEY"):
         return AudioServices(stt_provider="deepgram", tts_provider="elevenlabs")
-    if os.environ.get("AZURE_SPEECH_KEY"):
-        raise RuntimeError(
-            "AZURE_SPEECH_KEY detected but the Azure TTS wiring is not implemented "
-            "yet — set ELEVENLABS_API_KEY to use audio mode today."
-        )
     raise RuntimeError(
         "Audio mode requires a TTS key: set ELEVENLABS_API_KEY (persona voices). "
         "None is set — run with --mode text for offline execution."
@@ -108,6 +112,14 @@ class PipecatAudioEngine:
         resolve_audio_services()
         self.voice_id = voice_id
         self.sample_rate = sample_rate
+        config = resolve_voice_config()
+        self._gateway: VoiceGatewayAudioEngine | None = None
+        if not config.direct:
+            self._gateway = VoiceGatewayAudioEngine(config, voice_id, sample_rate)
+            self._deepgram_key = ""
+            self._elevenlabs_key = ""
+            self._aiohttp_session = None
+            return
         self._deepgram_key = os.environ["DEEPGRAM_API_KEY"]
         self._elevenlabs_key = os.environ["ELEVENLABS_API_KEY"]
         self._aiohttp_session: aiohttp.ClientSession | None = None
@@ -118,12 +130,17 @@ class PipecatAudioEngine:
         return self._aiohttp_session
 
     async def aclose(self) -> None:
+        if self._gateway is not None:
+            await self._gateway.aclose()
+            return
         if self._aiohttp_session is not None:
             await self._aiohttp_session.close()
             self._aiohttp_session = None
 
     async def synthesize(self, text: str) -> bytes:
         """Text -> PCM s16le mono @16kHz through an ElevenLabs Pipecat pipeline."""
+        if self._gateway is not None:
+            return await self._gateway.synthesize(text)
         tts = ElevenLabsHttpTTSService(
             api_key=self._elevenlabs_key,
             aiohttp_session=await self._session(),
@@ -144,8 +161,19 @@ class PipecatAudioEngine:
             )
         return bytes(collector.audio)
 
+    async def synthesize_chunks(self, text: str):
+        if self._gateway is not None:
+            async for chunk in self._gateway.synthesize_chunks(text):
+                yield chunk
+            return
+        # Direct providers are local/test-only and may not expose progressive
+        # chunks through Pipecat; keep the same adapter contract.
+        yield await self.synthesize(text)
+
     async def transcribe(self, pcm: bytes) -> str:
         """PCM s16le mono @16kHz -> text through a Deepgram Pipecat pipeline."""
+        if self._gateway is not None:
+            return await self._gateway.transcribe(pcm)
         stt = DeepgramSTTService(
             api_key=self._deepgram_key,
             sample_rate=self.sample_rate,
@@ -179,6 +207,16 @@ class PipecatAudioEngine:
         if collector.errors:
             raise RuntimeError(f"Deepgram STT error: {'; '.join(collector.errors)}")
         return " ".join(collector.transcripts).strip()
+
+    async def transcribe_stream(self, chunks, *, on_interim=None) -> str:
+        if self._gateway is not None:
+            return await self._gateway.transcribe_stream(
+                chunks, on_interim=on_interim
+            )
+        # Direct providers are local/test-only. Production always streams
+        # through the governed LiteLLM proxy and never receives Deepgram keys.
+        pcm = b"".join([chunk async for chunk in chunks])
+        return await self.transcribe(pcm)
 
     async def _run_pipeline(
         self,
@@ -319,6 +357,8 @@ class AudioTransportAdapter:
         self.utterances: list[tuple[int, str, str]] = []
         # Optional LivePublisher: per-utterance turn_audio for the live UI.
         self.live: Any | None = None
+        self._pending_messages: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self.barge_in_count = 0
 
     @property
     def url(self) -> str:
@@ -334,9 +374,117 @@ class AudioTransportAdapter:
         self.recorder.add_silence(seconds, line_pcm=line)
 
     async def send_text(self, text: str) -> None:
-        pcm = await self.engine.synthesize(text)
-        if self.channel_fx is not None:
-            pcm = self.channel_fx.process(pcm)
+        streamed = hasattr(self.engine, "synthesize_chunks") and hasattr(
+            self.inner, "send_audio_chunk"
+        )
+        if streamed:
+            chunks: list[bytes] = []
+            stream_failed = False
+            interrupted = False
+            barge = asyncio.Event()
+            watcher: asyncio.Task | None = None
+
+            async def watch_inbound_speech() -> None:
+                while True:
+                    message = await self.inner.receive(timeout=24 * 60 * 60)
+                    if (
+                        isinstance(message, dict)
+                        and message.get("type") == "event"
+                        and message.get("name") == "speech_started"
+                    ):
+                        barge.set()
+                        return
+                    await self._pending_messages.put(message)
+
+            async def await_or_barge(awaitable):
+                operation = asyncio.create_task(awaitable)
+                interrupted_wait = asyncio.create_task(barge.wait())
+                done, _ = await asyncio.wait(
+                    {operation, interrupted_wait},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if interrupted_wait in done:
+                    operation.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await operation
+                    return None, True
+                interrupted_wait.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await interrupted_wait
+                return await operation, False
+
+            iterator = self.engine.synthesize_chunks(text)
+            if hasattr(self.inner, "clear_audio"):
+                watcher = asyncio.create_task(watch_inbound_speech())
+            try:
+                while True:
+                    try:
+                        raw_chunk, interrupted = await await_or_barge(anext(iterator))
+                    except StopAsyncIteration:
+                        break
+                    if interrupted:
+                        break
+                    chunk = (
+                        self.channel_fx.process_stream(raw_chunk)
+                        if self.channel_fx is not None
+                        else raw_chunk
+                    )
+                    if not chunk:
+                        continue
+                    chunks.append(chunk)
+                    # This await is the actual egress boundary used by the benchmark:
+                    # audio is forwarded as each provider chunk arrives.
+                    _, interrupted = await await_or_barge(
+                        self.inner.send_audio_chunk(
+                            chunk, sample_rate=self.engine.sample_rate
+                        )
+                    )
+                    if interrupted:
+                        break
+                if interrupted:
+                    self.barge_in_count += 1
+                    if self.channel_fx is not None:
+                        self.channel_fx.abort_stream()
+                    await iterator.aclose()
+                    await self.inner.clear_audio()
+                if self.channel_fx is not None:
+                    final_chunk = (
+                        b""
+                        if interrupted
+                        else self.channel_fx.process_stream(b"", final=True)
+                    )
+                    if final_chunk:
+                        chunks.append(final_chunk)
+                        await self.inner.send_audio_chunk(
+                            final_chunk, sample_rate=self.engine.sample_rate
+                        )
+            except BaseException:
+                stream_failed = True
+                if self.channel_fx is not None:
+                    self.channel_fx.abort_stream()
+                raise
+            finally:
+                if watcher is not None:
+                    watcher.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await watcher
+                if hasattr(self.inner, "finish_audio") and not interrupted:
+                    try:
+                        await self.inner.finish_audio(
+                            sample_rate=self.engine.sample_rate
+                        )
+                    except Exception:
+                        if not stream_failed:
+                            raise
+            pcm = b"".join(chunks)
+            if not pcm and not interrupted:
+                raise RuntimeError("voice gateway returned no TTS audio")
+        else:
+            pcm = await self.engine.synthesize(text)
+            if self.channel_fx is not None:
+                pcm = self.channel_fx.process(pcm)
+        if not pcm:
+            return
         segment = self.recorder.add("tester", pcm)
         self.utterances.append((segment, "tester", text))
         self.tts_turns += 1
@@ -344,7 +492,8 @@ class AudioTransportAdapter:
             # the tester `turn` was already recorded by CallRunner — the
             # publisher pairs this audio with that turnIndex immediately
             self.live.add_turn_audio("tester", pcm, self.engine.sample_rate)
-        await self.inner.send_audio(pcm, sample_rate=self.engine.sample_rate)
+        if not streamed:
+            await self.inner.send_audio(pcm, sample_rate=self.engine.sample_rate)
 
     async def send_dtmf(self, digits: str) -> None:
         await self.inner.send_dtmf(digits)
@@ -352,13 +501,87 @@ class AudioTransportAdapter:
     async def hangup(self) -> None:
         await self.inner.hangup()
 
+    async def finish_audio(self, sample_rate: int = SAMPLE_RATE) -> None:
+        finish = getattr(self.inner, "finish_audio", None)
+        if finish is not None:
+            await finish(sample_rate=sample_rate)
+
+    async def close(self) -> None:
+        close = getattr(self.inner, "close", None)
+        if close is not None:
+            await close()
+
+    async def _receive_streaming_audio(
+        self, first: dict[str, Any], timeout: float
+    ) -> dict[str, Any]:
+        audio = bytearray(base64.b64decode(first.get("data", "")))
+        queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=32)
+
+        async def chunks():
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    return
+                yield chunk
+
+        await queue.put(bytes(audio))
+        transcript_task = asyncio.create_task(self.engine.transcribe_stream(chunks()))
+        try:
+            while True:
+                message = await self.inner.receive(timeout)
+                if message is None:
+                    raise RuntimeError("audio stream closed before audio_end")
+                kind = message.get("type")
+                if kind == "audio_chunk":
+                    chunk = base64.b64decode(message.get("data", ""))
+                    audio.extend(chunk)
+                    # Bounded queue: capture naturally backpressures if upstream
+                    # recognition cannot keep up.
+                    await queue.put(chunk)
+                    continue
+                if kind == "audio_end":
+                    await queue.put(None)
+                    break
+                if kind == "event" and message.get("name") == "speech_started":
+                    continue
+                await self._pending_messages.put(message)
+            text = await transcript_task
+        except BaseException:
+            transcript_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await transcript_task
+            raise
+
+        pcm = bytes(audio)
+        segment = self.recorder.add("agent", pcm)
+        speaker = first.get("speaker", "agent")
+        self.utterances.append((segment, speaker, text))
+        self.stt_turns += 1
+        if self.live is not None:
+            self.live.add_turn_audio(speaker, pcm, self.engine.sample_rate)
+        return {
+            "type": "text",
+            "speaker": speaker,
+            "text": text,
+            "source": "stt-stream",
+        }
+
     async def receive(self, timeout: float) -> dict[str, Any] | None:
         while True:
-            msg = await self.inner.receive(timeout)
+            if not self._pending_messages.empty():
+                msg = await self._pending_messages.get()
+            else:
+                msg = await self.inner.receive(timeout)
             if msg is None:
                 return None
             if msg.get("type") == "event" and msg.get("name") == "mode_set":
                 continue  # handshake ack
+            if msg.get("type") == "event" and msg.get("name") == "speech_started":
+                continue  # VAD control signal; consumed only by active TTS barge-in
+            if msg.get("type") == "audio_start":
+                if not hasattr(self.engine, "transcribe_stream"):
+                    raise RuntimeError("audio_start requires a streaming STT engine")
+                return await self._receive_streaming_audio(msg, timeout)
             if msg.get("type") != "audio":
                 return msg
             pcm = base64.b64decode(msg.get("data", ""))
