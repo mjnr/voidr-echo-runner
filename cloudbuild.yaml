@@ -1,0 +1,29 @@
+steps:
+  - id: Build
+    name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - build
+      - --platform
+      - linux/amd64
+      - --tag
+      - ${_IMAGE}
+      - .
+
+  - id: Push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_IMAGE}
+    waitFor:
+      - Build
+
+images:
+  - ${_IMAGE}
+
+substitutions:
+  _IMAGE: southamerica-east1-docker.pkg.dev/perceptive-bay-340802/voidr-products/voidr-echo-runner:dev
+
+options:
+  logging: CLOUD_LOGGING_ONLY
