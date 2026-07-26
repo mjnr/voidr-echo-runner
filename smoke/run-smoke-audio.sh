@@ -2,7 +2,7 @@
 # Smoke E2E de ÁUDIO: voidr-echo-runner (--mode audio) <-> vivo-autopilot-mock.
 #
 # Mesma matriz do smoke texto, mas com áudio real fluindo nos dois sentidos
-# (ElevenLabs TTS + Deepgram STT — CONSOME CRÉDITOS das duas APIs):
+# por uma virtual key LiteLLM (TTS + STT — pode consumir créditos upstream):
 #
 #   1. Mock limpo: 2 cases -> espera PASSED.
 #   2. Mock com MOCK_DEVIATION=jornada_errada: 2 cases -> espera FAILED
@@ -14,7 +14,7 @@
 # (entries[].source == "stt"). O case tc-003 dita um CPF sintético e o
 # check_redaction_audio confere placeholder no transcript + beep no WAV.
 #
-# Requer DEEPGRAM_API_KEY e ELEVENLABS_API_KEY (via ambiente ou .env dos repos).
+# Requer LITELLM_BASE_URL, LITELLM_API_KEY e aliases TTS/STT governados.
 #
 # Uso: ./smoke/run-smoke-audio.sh   (de qualquer diretório)
 set -u

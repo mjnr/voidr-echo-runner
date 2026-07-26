@@ -264,6 +264,9 @@ def test_llm_brain_sends_structured_emotional_state(monkeypatch):
         "HIVE_URL": "http://hive.test:3001",
         "HIVE_GATEWAY_TOKEN": "t",
         "VOIDR_ORG_ID": "org",
+        "HIVE_ECHO_PERSONA_V3_MODEL_REVISION": (
+            "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2"
+        ),
     }.items():
         monkeypatch.setenv(key, value)
     from voidr_echo_runner.brain import LLMBrain
@@ -271,60 +274,49 @@ def test_llm_brain_sends_structured_emotional_state(monkeypatch):
     captured: dict = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        captured["body"] = json.loads(request.content)
-        return httpx.Response(200, json={"text": "uai", "model": "m", "usage": {}})
+        body = json.loads(request.content)
+        captured["body"] = body
+        return httpx.Response(
+            200,
+            json={
+                "text": "uai",
+                "provenance": {
+                    "source": "hive-llm",
+                    "contractVersion": "v3",
+                    "conversationId": body["conversationId"],
+                    "turnId": body["turnId"],
+                    "policyVersion": body["policyVersion"],
+                    "promptVersion": "echo-persona-system-v3.0.0",
+                    "promptHash": "p",
+                    "provider": "litellm",
+                    "modelAlias": "deepseek-v4-pro",
+                    "model": "deepseek-v4-pro",
+                    "modelResolved": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
+                    "modelVersion": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
+                    "deploymentPin": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
+                    "deploymentId": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
+                    "modelHash": "3626b4be7e3c9359631c9f400211a57aa4140c9277d334971f282c75c7521258",
+                    "completionId": "c1",
+                    "traceId": "trace-1",
+                    "generatedAt": "2026-07-26T00:00:00Z",
+                },
+                "usage": {},
+            },
+        )
 
     client = httpx.Client(transport=httpx.MockTransport(handler))
     brain = LLMBrain(marcia(), goal="ver saldo", client=client)
     brain.emotional = EmotionalStateMachine.for_persona(marcia(), seed=42)
     brain.emotional.update("Pode me informar o seu CPF?")
     brain.emotional.update("Pode me informar o seu CPF, por favor?")
-    brain.reply("Pode me informar o seu CPF, por favor?")
+    brain.take_turn("Pode me informar o seu CPF, por favor?")
 
-    # Contract v2: structured field, no legacy block inside goalTemplate.
+    # Contract v3: structured state is a Hive directive, never local speech.
     state = captured["body"]["emotionalState"]
     assert state["emotion"] == "ansioso"
     assert state["intensity"] == pytest.approx(0.45)  # 0.30 - 0.05 + 0.20
     assert state["guidance"]
     assert "[ESTADO EMOCIONAL" not in captured["body"]["persona"]["goalTemplate"]
-
-
-def test_llm_brain_falls_back_to_goal_template_on_400(monkeypatch):
-    import httpx
-    import json
-
-    for key, value in {
-        "HIVE_URL": "http://hive.test:3001",
-        "HIVE_GATEWAY_TOKEN": "t",
-        "VOIDR_ORG_ID": "org",
-    }.items():
-        monkeypatch.setenv(key, value)
-    from voidr_echo_runner.brain import LLMBrain
-
-    bodies: list[dict] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        bodies.append(body)
-        if "emotionalState" in body:  # old hive schema: rejects the new field
-            return httpx.Response(400, json={"error": "Invalid persona-turn payload"})
-        return httpx.Response(200, json={"text": "uai", "model": "m", "usage": {}})
-
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    brain = LLMBrain(marcia(), goal="ver saldo", client=client)
-    brain.emotional = EmotionalStateMachine.for_persona(marcia(), seed=42)
-    brain.emotional.update("Pode me informar o seu CPF?")
-
-    assert brain.reply("Pode me informar o seu CPF?") == "uai"
-    assert len(bodies) == 2  # structured attempt, then legacy fallback
-    assert "emotionalState" not in bodies[1]
-    assert "[ESTADO EMOCIONAL" in bodies[1]["persona"]["goalTemplate"]
-    # Fallback is sticky: subsequent turns go straight to the legacy shape.
-    brain.reply("Certo, anotei.")
-    assert len(bodies) == 3
-    assert "emotionalState" not in bodies[2]
-
-
 def test_guidance_demands_human_at_threshold():
     model = EmotionalModel(
         initialEmotion="irritado",

@@ -9,6 +9,7 @@ persona's ElevenLabs voice and played through the speaker (afplay).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from pathlib import Path
 
 from .brain import GENERIC_JOURNEY_STATE, HiveError, LLMBrain
 from .models import Persona, load_persona_catalog
+from .voice_gateway import VoiceGatewayAudioEngine, resolve_voice_config
 
 ELEVENLABS_MODEL = "eleven_flash_v2_5"
 TTS_SAMPLE_RATE = 16000
@@ -33,7 +35,6 @@ RED = "\033[31m" if _TTY else ""
 RESET = "\033[0m" if _TTY else ""
 
 HELP = """comandos:
-  /escalate   força Sonnet no próximo turno
   /state      mostra o estado atual da jornada
   /emotion    curva emocional da conversa (estado por turno)
   /help       esta ajuda
@@ -41,36 +42,35 @@ HELP = """comandos:
 
 
 class VoicePlayer:
-    """ElevenLabs TTS + afplay. Direct REST on purpose: the playground favors
-    snappiness; the full Pipecat pipeline lives in the tested audio mode."""
+    """LiteLLM TTS + afplay for the local persona playground."""
 
     def __init__(self, persona: Persona):
         self.voice_id = persona.speech.voiceId
-        self.api_key = os.environ.get("ELEVENLABS_API_KEY", "")
-        self.enabled = bool(self.api_key and self.voice_id)
+        try:
+            self.config = resolve_voice_config()
+        except RuntimeError:
+            self.config = None
+        self.enabled = bool(self.config and not self.config.direct and self.voice_id)
 
     def speak(self, text: str) -> str | None:
         """Synthesize + play; returns a warning message on failure."""
-        import httpx
-
         try:
-            response = httpx.post(
-                f"https://api.elevenlabs.io/v1/text-to-speech/{self.voice_id}",
-                params={"output_format": f"pcm_{TTS_SAMPLE_RATE}"},
-                headers={"xi-api-key": self.api_key},
-                json={"text": text, "model_id": ELEVENLABS_MODEL, "language_code": "pt"},
-                timeout=30.0,
-            )
-        except httpx.TransportError as exc:
+            async def synthesize() -> bytes:
+                engine = VoiceGatewayAudioEngine(self.config, self.voice_id)
+                try:
+                    return await engine.synthesize(text)
+                finally:
+                    await engine.aclose()
+
+            pcm = asyncio.run(synthesize())
+        except Exception as exc:  # playground degrades to text
             return f"voz indisponível ({type(exc).__name__})"
-        if response.status_code != 200:
-            return f"voz indisponível (ElevenLabs {response.status_code})"
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             with wave.open(tmp, "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
                 wav.setframerate(TTS_SAMPLE_RATE)
-                wav.writeframes(response.content)
+                wav.writeframes(pcm)
             path = tmp.name
         try:
             subprocess.run(["afplay", path], check=False)
@@ -133,7 +133,7 @@ def run_chat(args) -> int:
 
     goal = args.goal or "resolver um problema na minha linha Vivo"
     try:
-        brain = LLMBrain(persona, goal, args.seed, escalate=args.escalate)
+        brain = LLMBrain(persona, goal, args.seed)
     except RuntimeError as exc:
         print(f"echo-runner chat: {exc}", file=sys.stderr)
         return 2
@@ -148,7 +148,7 @@ def run_chat(args) -> int:
         voice = VoicePlayer(persona)
         if not voice.enabled:
             print(
-                f"{YELLOW}aviso: --voice sem ELEVENLABS_API_KEY (ou persona sem voiceId) "
+                f"{YELLOW}aviso: --voice sem LiteLLM configurado (ou persona sem voiceId) "
                 f"— seguindo só com texto{RESET}"
             )
             voice = None
@@ -157,7 +157,6 @@ def run_chat(args) -> int:
 
     current_state = next(iter(flow.states)) if flow else "conversa"
     turns = 0
-    force_escalate = False
     while True:
         try:
             agent_text = input(f"{CYAN}{BOLD}agente>{RESET} ").strip()
@@ -188,11 +187,6 @@ def run_chat(args) -> int:
                     f" {DIM}{events}{RESET}{action}"
                 )
             continue
-        if agent_text == "/escalate":
-            force_escalate = True
-            print(f"{YELLOW}próximo turno será escalado (Sonnet){RESET}")
-            continue
-
         state_changed = False
         if classifier is not None and flow is not None:
             state = classifier.classify(agent_text)
@@ -213,16 +207,14 @@ def run_chat(args) -> int:
         emo_rec = emotional.update(agent_text, state_changed=state_changed)
 
         try:
-            result = brain.take_turn(agent_text, escalate=force_escalate or None)
+            result = brain.take_turn(agent_text)
         except HiveError as exc:
             print(f"{RED}erro: {exc}{RESET}")
             continue
-        finally:
-            force_escalate = False
         turns += 1
         usage = result.get("usage") or {}
-        model = result.get("model", "?")
-        badge = f"{YELLOW}sonnet{RESET}" if usage.get("escalated") else f"{GREEN}{model}{RESET}"
+        model = result["provenance"]["model"]
+        badge = f"{GREEN}{model}{RESET}"
         state_tag = f" · {brain.journey_state['currentState']}" if flow else ""
         emo_color = RED if emo_rec.intensity >= 0.6 else (YELLOW if emo_rec.intensity >= 0.3 else GREEN)
         emo_tag = f" · {emo_color}{emotional.badge()}{RESET}{DIM}"

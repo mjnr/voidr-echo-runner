@@ -35,6 +35,8 @@ class LocalWebSocketTransport:
     def __init__(self, url: str):
         self.url = url
         self._ws: websockets.ClientConnection | None = None
+        self._audio_buffer = bytearray()
+        self._audio_sample_rate: int | None = None
 
     async def connect(self) -> None:
         self._ws = await websockets.connect(self.url)
@@ -69,6 +71,21 @@ class LocalWebSocketTransport:
             }
         )
 
+    async def send_audio_chunk(self, pcm: bytes, sample_rate: int = 16000) -> None:
+        if self._audio_sample_rate not in (None, sample_rate):
+            raise ValueError("sample rate changed within an utterance")
+        self._audio_sample_rate = sample_rate
+        self._audio_buffer.extend(pcm)
+
+    async def finish_audio(self, sample_rate: int = 16000) -> None:
+        if self._audio_sample_rate not in (None, sample_rate):
+            raise ValueError("sample rate changed within an utterance")
+        pcm = bytes(self._audio_buffer)
+        self._audio_buffer.clear()
+        self._audio_sample_rate = None
+        if pcm:
+            await self.send_audio(pcm, sample_rate)
+
     async def hangup(self) -> None:
         await self._send({"type": "event", "name": "hangup"})
         await self.close()
@@ -85,6 +102,8 @@ class LocalWebSocketTransport:
         return json.loads(raw)
 
     async def close(self) -> None:
+        self._audio_buffer.clear()
+        self._audio_sample_rate = None
         if self._ws is not None:
             await self._ws.close()
             self._ws = None

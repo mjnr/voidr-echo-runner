@@ -233,6 +233,8 @@ class TurnPlan:
     memory_lapse: bool = False
     lapse_category: str | None = None
     extra_delay_s: float = 0.0
+    hesitation: str = "none"
+    latency: str = "normal"
 
 
 class Humanizer:
@@ -290,8 +292,46 @@ class Humanizer:
             if any(kw in norm for kw in keywords)
         ]
 
-    def plan_turn(self, agent_text: str) -> TurnPlan:
+    def plan_turn(
+        self,
+        agent_text: str,
+        *,
+        emotion: str | None = None,
+        emotion_intensity: float | None = None,
+    ) -> TurnPlan:
         plan = TurnPlan()
+        plan.hesitation = self._rng.choice(("none", "light", "self-correction"))
+        plan.latency = self._rng.choice(("quick", "normal", "deliberate"))
+        seeded_directives = [
+            (
+                "Hesitação seeded deste turno: "
+                f"{plan.hesitation}. Redija a fala coerente com esse grau, "
+                "sem copiar uma frase pronta."
+            ),
+            (
+                "Latência seeded deste turno: "
+                f"{plan.latency}. Redija o ritmo e a extensão da resposta "
+                "compatíveis com essa cadência."
+            ),
+        ]
+        if emotion:
+            seeded_directives.append(
+                f"Emoção seeded deste turno: {emotion} "
+                f"(intensidade {float(emotion_intensity or 0.0):.2f}/1). "
+                "Faça isso transparecer na redação sem declarar o estado."
+            )
+        vocabulary = list(self.persona.vocabulary)
+        if vocabulary:
+            selected = vocabulary[self._rng.randrange(len(vocabulary))]
+            seeded_directives.append(
+                f"Vocabulário seeded deste turno: considere usar naturalmente "
+                f"o marcador regional {selected!r}, sem caricatura nem obrigação de repeti-lo."
+            )
+
+        def add_directive(value: str) -> None:
+            if len(plan.directives) < 6:
+                plan.directives.append(value)
+
         for category in self._requested_categories(agent_text):
             key = self.massa.key_for_category(category)
             if key is None:
@@ -300,7 +340,7 @@ class Humanizer:
             placeholder = self.massa.placeholder(key)
             if category in self._retrieved:
                 # She has the document in hand now — repeat without drama.
-                plan.directives.append(
+                add_directive(
                     f"Se pedirem seu {label} de novo, você JÁ está com ele em mãos: "
                     f"dite de novo, sem hesitar, usando exatamente {placeholder}."
                 )
@@ -310,7 +350,7 @@ class Humanizer:
                 plan.memory_lapse = True
                 plan.lapse_category = category
                 plan.extra_delay_s += 1.8 + self._rng.random() * 2.4
-                plan.directives.append(
+                add_directive(
                     f"O atendente pediu seu {label} e você NÃO lembra de cabeça: "
                     f'comece hesitando de verdade ("ai, peraí...", "deixa eu pegar aqui...", '
                     f'"onde foi que eu anotei..."), demore procurando (use reticências), '
@@ -318,10 +358,12 @@ class Humanizer:
                     f"o placeholder {placeholder} — nunca invente números."
                 )
             else:
-                plan.directives.append(
+                add_directive(
                     f"Quando informar seu {label}, dite com naturalidade usando "
                     f"exatamente o placeholder {placeholder} — nunca invente números."
                 )
+        for directive in seeded_directives:
+            add_directive(directive)
         return plan
 
     # -- reply post-processing ---------------------------------------------------
@@ -333,17 +375,6 @@ class Humanizer:
         resolved, used = self.massa.resolve_placeholders(reply)
         self.substituted_keys.extend(used)
         return resolved
-
-    def scripted_prefix(self, plan: TurnPlan) -> str:
-        """Hesitation prefix for the deterministic ScriptedBrain (no LLM)."""
-        if not plan.memory_lapse:
-            return ""
-        options = (
-            "Ai, peraí... deixa eu pegar aqui... ",
-            "Hã... peraí um instantinho, deixa eu procurar... ",
-            "É... deixa eu ver onde eu anotei isso... ",
-        )
-        return options[self._rng.randrange(len(options))]
 
     # -- timing ------------------------------------------------------------------
 

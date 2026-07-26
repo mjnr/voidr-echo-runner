@@ -1,114 +1,55 @@
-"""Persona brains.
-
-`ScriptedBrain`: deterministic, seeded rule engine (default for tests) that
-renders utterances from the persona's goalTemplate + vocabulary + the agent's
-last utterance.
-
-`LLMBrain`: LLM-driven persona via the hive's synchronous gateway
-(`POST {HIVE_URL}/echo/persona-turn`). Per ARCHITECTURE.md section 8.5, ALL
-LLM consumption is centralized in the hive — this runner holds no LLM keys;
-model routing (DeepSeek v4 Pro -> Sonnet escalation) and billing live there.
-"""
+"""AI-only persona turns through Hive's strict v3 contract."""
 
 from __future__ import annotations
 
+import hashlib
 import os
-import random
+import re
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 from .models import Persona
-from .textutil import keyword_matches, to_first_person
+from .governed_url import validate_governed_url
 
 
 class PersonaBrain(Protocol):
-    def reply(self, agent_utterance: str) -> str:
-        """Produce the persona's next utterance given the agent's last turn."""
+    def take_turn(
+        self, agent_utterance: str, *, turn_id: str | None = None
+    ) -> dict[str, Any]:
+        """Produce one Hive-authored persona turn with provenance."""
         ...
-
-
-# (trigger keywords on the agent utterance, canned persona intent) — first match wins
-_RULES: list[tuple[list[str], str]] = [
-    (
-        ["titular", "confirmar os seus dados", "confirmar seus dados"],
-        "confirm_identity",
-    ),
-    (
-        ["como posso te ajudar", "como posso ajudar", "o que voce precisa", "me contar de novo"],
-        "state_goal",
-    ),
-    (
-        [
-            "posso enviar",
-            "posso te mandar",
-            "posso mandar",
-            "prefere o link",
-            "quer aproveitar",
-            "quer resolver",
-            "quer fazer",
-        ],
-        "accept_offer",
-    ),
-]
-
-_RESPONSES: dict[str, str] = {
-    "confirm_identity": "Sim, sou eu, o titular da linha, pode confirmar.",
-    "accept_offer": "Sim, quero sim, pode mandar, por favor.",
-    "ack": "Entendi. Pode continuar, por favor.",
-}
-
-
-class ScriptedBrain:
-    """Deterministic v0 brain. Same persona + same seed => same utterances."""
-
-    # Framings used when the agent asks the goal AGAIN ("não entendi, pode
-    # me contar de novo?"): a real person REPHRASES instead of repeating the
-    # same sentence verbatim (bug real: persona repetia o goalTemplate
-    # literalmente quando a URA pedia para repetir). Deterministic per seed.
-    _RESTATE_FRAMINGS = (
-        "Então, deixa eu falar de novo, mais devagar: {goal}",
-        "Tá, vou explicar de outro jeito: {goal}",
-        "Como eu falei: {goal}",
-    )
-
-    def __init__(self, persona: Persona, goal: str, seed: int):
-        self.persona = persona
-        self.goal = goal
-        self.rng = random.Random(seed)
-        self._goal_statements = 0
-
-    def reply(self, agent_utterance: str) -> str:
-        intent = "ack"
-        for triggers, rule_intent in _RULES:
-            if any(keyword_matches(t, agent_utterance) for t in triggers):
-                intent = rule_intent
-                break
-        if intent == "state_goal":
-            # goalTemplate/goal são autorados e chegam MUITAS vezes em 3ª
-            # pessoa ("Ele quer falar sobre a conta...") — a persona fala em
-            # 1ª pessoa, sempre.
-            base = to_first_person(self.persona.goalTemplate.format(goal=self.goal))
-            if self._goal_statements > 0:
-                framing = self._RESTATE_FRAMINGS[
-                    (self._goal_statements - 1) % len(self._RESTATE_FRAMINGS)
-                ]
-                base = framing.format(goal=base[0].lower() + base[1:] if base else base)
-            self._goal_statements += 1
-        else:
-            base = _RESPONSES[intent]
-        return self._stylize(base)
-
-    def _stylize(self, utterance: str) -> str:
-        """Seeded regional/disfluency flourishes; never changes the intent."""
-        if self.rng.random() < self.persona.speech.disfluencyRate:
-            utterance = "É... " + utterance[0].lower() + utterance[1:]
-        if self.persona.vocabulary and self.rng.random() < 0.5:
-            flourish = self.rng.choice(self.persona.vocabulary)
-            utterance = f"{utterance.rstrip('.')}. {flourish.capitalize()}."
-        return utterance
 
 
 class HiveError(RuntimeError):
     """A persona-turn call to the hive failed (payload, PII guard or gateway)."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        turn_id: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.code = code
+        self.turn_id = turn_id
+
+    @property
+    def outcome(self) -> str:
+        code = (self.code or "").lower()
+        if self.status_code in {429, 504} or code in {
+            "deadline_exceeded",
+            "upstream_rate_limited",
+            "turn_in_progress",
+        }:
+            return "inconclusive"
+        if self.status_code is None or self.status_code >= 500:
+            return "degraded"
+        return "failed"
 
 
 GENERIC_JOURNEY_STATE: dict[str, Any] = {
@@ -119,16 +60,23 @@ GENERIC_JOURNEY_STATE: dict[str, Any] = {
 
 
 class LLMBrain:
-    """Persona brain backed by the hive LLM gateway (no LLM keys here).
+    """Persona brain backed exclusively by Hive persona-turn v3."""
 
-    Each turn POSTs the persona profile + journey state + conversation history
-    to `{HIVE_URL}/echo/persona-turn` and returns the in-character reply.
-    Mutate `journey_state` between turns to keep the persona contextualized
-    (the chat mode does this with the keyword state classifier).
-    """
-
-    REQUIRED_ENV = ("HIVE_URL", "HIVE_GATEWAY_TOKEN", "VOIDR_ORG_ID")
-    TIMEOUT_S = 20.0
+    REQUIRED_ENV = (
+        "HIVE_URL",
+        "HIVE_GATEWAY_TOKEN",
+        "VOIDR_ORG_ID",
+        "HIVE_ECHO_PERSONA_V3_MODEL_REVISION",
+    )
+    DEADLINE_S = 20.0
+    # Leave transport headroom so Hive can return its structured
+    # DEADLINE_EXCEEDED response before the runner aborts the HTTP request.
+    HTTP_TIMEOUT_S = 25.0
+    POLICY_VERSION = "echo-persona-turn-v3.0.0"
+    CONTRACT_VERSION = "v3"
+    PROMPT_VERSION = "echo-persona-system-v3.0.0"
+    MODEL_ALIAS = "deepseek-v4-pro"
+    MODEL_REVISION = "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2"
 
     def __init__(
         self,
@@ -136,26 +84,49 @@ class LLMBrain:
         goal: str,
         seed: int | None = None,
         *,
-        escalate: bool = False,
         client: Any | None = None,
+        conversation_id: str | None = None,
     ):
         import httpx
 
         missing = [name for name in self.REQUIRED_ENV if not os.environ.get(name)]
         if missing:
             raise RuntimeError(
-                f"LLMBrain requires env vars: {', '.join(missing)} "
-                "(the hive is the LLM gateway — see .env.example). "
-                "Use the default ScriptedBrain for offline runs (--brain scripted)."
+                f"LLMBrain requires Hive env vars: {', '.join(missing)}"
             )
         self.persona = persona
         self.goal = goal
         self.seed = seed
-        self.escalate_default = escalate
-        self.base_url = os.environ["HIVE_URL"].rstrip("/")
+        self.base_url = validate_governed_url(
+            os.environ["HIVE_URL"], name="HIVE_URL"
+        )
         self.org_id = os.environ["VOIDR_ORG_ID"]
+        self.model_revision = os.environ["HIVE_ECHO_PERSONA_V3_MODEL_REVISION"].strip()
+        if not (
+            re.search(r"@sha256:[a-f0-9]{64}$", self.model_revision)
+            or re.fullmatch(
+                r"(?:.*@id:)?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                self.model_revision,
+                re.IGNORECASE,
+            )
+        ):
+            raise RuntimeError(
+                "HIVE_ECHO_PERSONA_V3_MODEL_REVISION must be an immutable "
+                "deployment/revision ID distinct from deepseek-v4-pro"
+            )
+        if self.model_revision != self.MODEL_REVISION:
+            raise RuntimeError(
+                "HIVE_ECHO_PERSONA_V3_MODEL_REVISION does not match this runner "
+                "release's immutable LiteLLM deployment UUID"
+            )
+        # Separate calls must never share a Redis idempotency namespace merely
+        # because persona/goal/seed match. Durable service executions pass an
+        # execution+shard-derived ID; ad-hoc run/chat sessions get a fresh one.
+        self.conversation_id = conversation_id or str(uuid.uuid4())
+        self._turn_number = 0
         self._client = client or httpx.Client(
-            timeout=self.TIMEOUT_S,
+            timeout=self.HTTP_TIMEOUT_S,
             headers={"Authorization": f"Bearer {os.environ['HIVE_GATEWAY_TOKEN']}"},
         )
         self.history: list[dict[str, str]] = []
@@ -167,77 +138,26 @@ class LLMBrain:
         from .redaction import RedactionSession
 
         self.redaction = RedactionSession()
-        # Optional deterministic emotional state machine (PERSONAS-SOTA P0.3).
-        # The OWNER of the conversation loop (CallRunner/chat) updates it per
-        # agent turn; this brain sends the current state as the structured
-        # `emotionalState` field (contract v2). Against an older hive that
-        # 400s on the field, we fall back once to the legacy workaround of
-        # embedding the [ESTADO EMOCIONAL] block in goalTemplate.
+        # Deterministic state remains runner-side and is sent only as a Hive
+        # directive. It never authors local speech.
         from .emotional import EmotionalStateMachine
 
         self.emotional: EmotionalStateMachine | None = None
-        self._legacy_emotional = False
-        # Ephemeral execution overrides (overrides.PersonaOverrides): the
-        # already-applied persona carries the mechanical effects (thresholds,
-        # temperament); this block tells the PROMPT the variation explicitly
-        # so adherence is verifiable by the fidelity judge. Against an older
-        # hive that 400s on the new fields we degrade once (contract v2.1).
         self.execution_overrides: Any | None = None
-        self._legacy_contract = False
-        # EXEC-REALISM (contract v2.2): per-turn behavioral directives set by
-        # the Humanizer (memory lapses, data dictation) + the persona's
-        # personal-data card (labels + {{massa.*}} placeholders — NEVER real
-        # values; the hive PII guard rejects clear PII by design). Against an
-        # older hive that 400s on the fields we degrade once, folding them
-        # into the goalTemplate text.
         self.turn_directives: list[str] = []
         self.personal_data: list[dict[str, str]] = []
-        self._legacy_realism = False
         self.total_cost_usd = 0.0
         self.last_model: str | None = None
         self.last_usage: dict[str, Any] | None = None
+        self.last_provenance: dict[str, Any] | None = None
 
     def _persona_payload(self) -> dict[str, Any]:
-        # Objective decoupling (mission delivery 4): the persona says WHO the
-        # person is; the objective comes from the JOURNEY (case goal) and is
-        # sent as the separate `journeyGoal` field. goalTemplate survives only
-        # as legacy style/fallback: `{goal}` placeholders are still resolved,
-        # and an empty template falls back to the journey goal so older hives
-        # (min 1 char) keep working.
+        # The persona says WHO the person is; the journey carries the goal.
         goal_template = self.persona.goalTemplate
         if self.goal and "{goal}" in goal_template:
             goal_template = goal_template.format(goal=self.goal)
         if not goal_template.strip():
             goal_template = self.goal or "Resolver o objetivo desta ligação."
-        if self._legacy_contract and self.goal:
-            # Old hive without `journeyGoal`: make the journey objective win
-            # by prepending it to the only field the old prompt reads.
-            goal_template = (
-                f"Objetivo desta ligação (definido pela jornada): {self.goal}\n\n"
-                f"{goal_template}"
-            )
-        if self.emotional is not None and self._legacy_emotional:
-            # Legacy workaround for hives without the structured field.
-            goal_template = f"{goal_template}\n\n{self.emotional.prompt_block()}"
-        if self._legacy_realism:
-            # Old hive without personalData/turnDirectives: fold both into the
-            # only free-text field the old prompt reads.
-            blocks: list[str] = []
-            if self.personal_data:
-                blocks.append(
-                    "[SEUS DADOS PESSOAIS — quando o atendente pedir, dite falando "
-                    "exatamente o placeholder (o sistema substitui fora do LLM):]\n"
-                    + "\n".join(
-                        f"- {item['label']}: {item['placeholder']}" for item in self.personal_data
-                    )
-                )
-            if self.turn_directives:
-                blocks.append(
-                    "[DIRETIVAS DESTE TURNO — siga à risca:]\n"
-                    + "\n".join(f"- {d}" for d in self.turn_directives)
-                )
-            if blocks:
-                goal_template = goal_template + "\n\n" + "\n\n".join(blocks)
         # Identity fields are optional in the contract, but when `name` is set
         # the hive locks the persona identity in the prompt (no more LLM
         # inventing "sou o João" for a persona called Cida).
@@ -321,10 +241,6 @@ class LLMBrain:
             speech["pronouns"] = self.persona.speech.pronouns
         if self.persona.speech.exemplars:
             speech["exemplars"] = list(self.persona.speech.exemplars)[:8]
-        if self.personal_data and not self._legacy_realism:
-            # v2.2: personal-data card (label + placeholder, never values) —
-            # the hive renders the <dados-pessoais> block from it.
-            v2["personalData"] = [dict(item) for item in self.personal_data]
         return {
             "id": self.persona.id,
             **identity,
@@ -345,135 +261,225 @@ class LLMBrain:
             "vocabulary": list(self.persona.vocabulary),
         }
 
-    def _build_payload(self, options: dict[str, Any]) -> dict[str, Any]:
+    def _build_payload(
+        self,
+        agent_utterance: str,
+        turn_id: str,
+        deadline_at: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
         persona_payload = self._persona_payload()
-        persona_payload["goalTemplate"] = self.redaction.redact(persona_payload["goalTemplate"])
         payload = {
             "organizationId": self.org_id,
+            "conversationId": self.conversation_id,
+            "turnId": turn_id,
+            "policyVersion": self.POLICY_VERSION,
+            "deadlineAt": deadline_at,
             "persona": persona_payload,
             "journeyState": self.journey_state,
             "history": [
                 {"role": turn["role"], "text": self.redaction.redact(turn["text"])}
                 for turn in self.history
-            ],
+            ]
+            + [{"role": "agent", "text": self.redaction.redact(agent_utterance)}],
             **({"options": options} if options else {}),
         }
-        if self.emotional is not None and not self._legacy_emotional:
-            # Structured field (contract v2) — precedence over the legacy
-            # goalTemplate block on the hive side.
+        if self.emotional is not None:
             payload["emotionalState"] = {
                 "emotion": self.emotional.emotion,
                 "intensity": self.emotional.intensity,
                 "guidance": self.emotional.guidance(),
             }
-        if not self._legacy_contract:
-            # Contract v2.1: objective decoupled from the persona + ephemeral
-            # execution variation. Older hives 400 on unknown fields → the
-            # caller degrades once via _legacy_contract.
-            if self.goal:
-                payload["journeyGoal"] = self.redaction.redact(self.goal)
-            if self.execution_overrides is not None:
-                summary = self.execution_overrides.summary_lines()
-                spice = self.execution_overrides.spice_instruction()
-                block: dict[str, Any] = {}
-                if summary:
-                    block["summary"] = summary
-                if spice:
-                    block["spice"] = spice
-                if block:
-                    payload["executionOverrides"] = block
-        if self.turn_directives and not self._legacy_realism:
-            # v2.2: per-turn realism directives (memory lapse, data dictation).
+        if self.goal:
+            payload["journeyGoal"] = self.redaction.redact(self.goal)
+        if self.execution_overrides is not None:
+            summary = self.execution_overrides.summary_lines()
+            spice = self.execution_overrides.spice_instruction()
+            block: dict[str, Any] = {}
+            if summary:
+                block["summary"] = summary
+            if spice:
+                block["spice"] = spice
+            if block:
+                payload["executionOverrides"] = block
+        if self.personal_data:
+            payload["personalData"] = [dict(item) for item in self.personal_data]
+        if self.turn_directives:
             payload["turnDirectives"] = list(self.turn_directives)
+        # Last-hop defense: recursively redact every textual field that can
+        # reach the persona prompt, including nested identity facts,
+        # profile/context, vocabulary, exemplars and glossary entries. Keep
+        # correlation/deadline fields byte-stable for idempotency/provenance.
+        for field in (
+            "persona",
+            "journeyState",
+            "history",
+            "emotionalState",
+            "goalProgress",
+            "journeyGoal",
+            "executionOverrides",
+            "personalData",
+            "turnDirectives",
+        ):
+            if field in payload:
+                payload[field] = self.redaction.redact_deep(payload[field])
         return payload
 
-    def _post(self, url: str, payload: dict[str, Any]) -> Any:
+    def _post(self, url: str, payload: dict[str, Any], turn_id: str) -> Any:
         import httpx
 
-        response = None
-        last_exc: Exception | None = None
-        for attempt in (1, 2):  # short timeout + 1 retry (transport/5xx)
-            try:
-                response = self._client.post(url, json=payload)
-            except httpx.TransportError as exc:
-                last_exc = exc
-                continue
-            if response.status_code < 500 or attempt == 2:
-                break
-        if response is None:
+        try:
+            return self._client.post(url, json=payload)
+        except httpx.TransportError as exc:
             raise HiveError(
-                f"hive unreachable at {url}: {type(last_exc).__name__}: {last_exc}"
-            ) from last_exc
-        return response
+                f"hive persona-turn v3 unreachable: {type(exc).__name__}: {exc}",
+                code="transport_error",
+                turn_id=turn_id,
+            ) from exc
 
-    def take_turn(self, agent_utterance: str, *, escalate: bool | None = None) -> dict[str, Any]:
-        """One persona turn; returns the full hive response (text/model/usage)."""
-        self.history.append({"role": "agent", "text": agent_utterance})
+    @staticmethod
+    def _required_string(data: dict[str, Any], key: str) -> str:
+        value = data.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"missing non-empty {key}")
+        return value
+
+    def _validate_response(self, data: Any, turn_id: str) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError("response must be an object")
+        text = self._required_string(data, "text")
+        provenance = data.get("provenance")
+        if not isinstance(provenance, dict):
+            raise ValueError("missing provenance object")
+        if provenance.get("contractVersion") != self.CONTRACT_VERSION:
+            raise ValueError("provenance.contractVersion must be v3")
+        if provenance.get("source") != "hive-llm":
+            raise ValueError("provenance.source must be hive-llm")
+        response_turn_id = self._required_string(provenance, "turnId")
+        if response_turn_id != turn_id:
+            raise ValueError("provenance.turnId does not match request turnId")
+        for key in (
+            "conversationId",
+            "policyVersion",
+            "promptVersion",
+            "promptHash",
+            "provider",
+            "modelAlias",
+            "model",
+            "modelResolved",
+            "modelVersion",
+            "deploymentPin",
+            "completionId",
+            "traceId",
+            "generatedAt",
+        ):
+            self._required_string(provenance, key)
+        if provenance["conversationId"] != self.conversation_id:
+            raise ValueError("provenance.conversationId does not match request")
+        if provenance["policyVersion"] != self.POLICY_VERSION:
+            raise ValueError("provenance.policyVersion does not match the policy pin")
+        if provenance["promptVersion"] != self.PROMPT_VERSION:
+            raise ValueError("provenance.promptVersion does not match the prompt pin")
+        if provenance["model"] != self.MODEL_ALIAS:
+            raise ValueError("provenance.model does not match the requested model alias")
+        if provenance["modelAlias"] != self.MODEL_ALIAS:
+            raise ValueError("provenance.modelAlias does not match the requested model alias")
+        if provenance["modelResolved"] != self.model_revision:
+            raise ValueError("provenance.modelResolved does not match the immutable model pin")
+        if provenance["modelVersion"] != self.model_revision:
+            raise ValueError(
+                "provenance.modelVersion does not match the immutable model revision pin"
+            )
+        if provenance["deploymentPin"] != self.model_revision:
+            raise ValueError("provenance.deploymentPin does not match the immutable pin")
+        if "@sha256:" in self.model_revision:
+            expected_digest = self.model_revision.rsplit("@", 1)[1]
+            if provenance.get("deploymentDigest") != expected_digest:
+                raise ValueError("provenance.deploymentDigest does not match the immutable pin")
+        else:
+            expected_id = self.model_revision.rsplit("@id:", 1)[-1]
+            if provenance.get("deploymentId") != expected_id:
+                raise ValueError("provenance.deploymentId does not match the immutable pin")
+        expected_model_hash = hashlib.sha256(self.model_revision.encode()).hexdigest()
+        if self._required_string(provenance, "modelHash") != expected_model_hash:
+            raise ValueError("provenance.modelHash does not match the model revision pin")
+        return {**data, "text": text, "provenance": provenance}
+
+    def take_turn(
+        self,
+        agent_utterance: str,
+        *,
+        turn_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Call persona-turn v3 once; never retries or downgrades."""
+        self._turn_number += 1
+        stable_turn_id = turn_id or str(
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"voidr:echo:{self.conversation_id}:persona-turn:{self._turn_number}",
+            )
+        )
         options: dict[str, Any] = {}
-        effective_escalate = self.escalate_default if escalate is None else escalate
-        if effective_escalate:
-            options["escalate"] = True
         if self.seed is not None:
             options["seed"] = self.seed
-        url = f"{self.base_url}/echo/persona-turn"
-
-        payload = self._build_payload(options)
-        response = self._post(url, payload)
-        if response.status_code == 400 and "emotionalState" in payload:
-            # Old hive schema without the structured field: fall back to the
-            # legacy goalTemplate block for the rest of the session.
-            self._legacy_emotional = True
-            payload = self._build_payload(options)
-            response = self._post(url, payload)
-        if response.status_code == 400 and (
-            "turnDirectives" in payload or "personalData" in payload.get("persona", {})
-        ):
-            # Old hive schema without the v2.2 realism fields: fold them into
-            # goalTemplate for the rest of the session.
-            self._legacy_realism = True
-            payload = self._build_payload(options)
-            response = self._post(url, payload)
-        if response.status_code == 400 and (
-            "journeyGoal" in payload or "executionOverrides" in payload
-        ):
-            # Old hive schema without the v2.1 fields: embed the journey goal
-            # into goalTemplate for the rest of the session.
-            self._legacy_contract = True
-            payload = self._build_payload(options)
-            response = self._post(url, payload)
+        url = f"{self.base_url}/echo/persona-turn/v3"
+        deadline_at = (
+            datetime.now(timezone.utc) + timedelta(seconds=self.DEADLINE_S)
+        ).isoformat().replace("+00:00", "Z")
+        payload = self._build_payload(agent_utterance, stable_turn_id, deadline_at, options)
+        started = time.monotonic()
+        response = self._post(url, payload, stable_turn_id)
         if response.status_code != 200:
-            detail = ""
+            detail = "Hive persona-turn v3 failed"
+            code = None
             try:
-                detail = response.json().get("error", "")
+                body = response.json()
+                error = body.get("error") if isinstance(body, dict) else None
+                if isinstance(error, dict):
+                    code = error.get("code")
+                    detail = str(error.get("message") or detail)
             except Exception:  # noqa: BLE001 — non-JSON error body
-                detail = response.text[:200]
-            hint = {
-                400: "payload inválido para o contrato persona-turn",
-                401: "HIVE_GATEWAY_TOKEN inválido",
-                422: "PII em claro detectado — redija transcripts (<CPF>, <TELEFONE>)",
-                502: "gateway LLM do hive indisponível (LiteLLM/chave não configurados?)",
-            }.get(response.status_code, "")
+                pass
             raise HiveError(
-                f"persona-turn falhou ({response.status_code}"
-                + (f" — {hint}" if hint else "")
-                + (f"): {detail}" if detail else ")")
+                f"persona-turn v3 failed ({response.status_code}"
+                + (f", {code}" if code else "")
+                + (f"): {detail}" if detail else ")"),
+                status_code=response.status_code,
+                code=str(code) if code else None,
+                turn_id=stable_turn_id,
             )
 
-        data = response.json()
+        try:
+            data = self._validate_response(response.json(), stable_turn_id)
+        except (ValueError, TypeError) as exc:
+            raise HiveError(
+                f"invalid persona-turn v3 response: {exc}",
+                status_code=502,
+                code="invalid_response",
+                turn_id=stable_turn_id,
+            ) from exc
         self.turn_directives = []  # directives are strictly per-turn
+        self.history.append({"role": "agent", "text": agent_utterance})
         self.history.append({"role": "persona", "text": data["text"]})
-        self.last_model = data.get("model")
+        # Preserve the validated Hive DTO byte-for-byte at the object level.
+        # Runner-local timing stays in a sibling trace and never replaces or
+        # truncates provider/model/hash/correlation provenance fields.
+        hive_provenance = dict(data["provenance"])
+        trace = {
+            "contractVersion": hive_provenance["contractVersion"],
+            "conversationId": hive_provenance["conversationId"],
+            "completionId": hive_provenance["completionId"],
+            "traceId": hive_provenance["traceId"],
+            "promptHash": hive_provenance["promptHash"],
+            "modelHash": hive_provenance["modelHash"],
+            "attempts": hive_provenance.get("attempts"),
+            "durationMs": int((time.monotonic() - started) * 1000),
+        }
+        self.last_provenance = hive_provenance
+        self.last_model = hive_provenance["model"]
         self.last_usage = data.get("usage") or {}
         self.total_cost_usd += float(self.last_usage.get("costUsd") or 0.0)
-        return data
+        return {**data, **hive_provenance, "provenance": hive_provenance, "trace": trace}
 
-    def reply(self, agent_utterance: str) -> str:
-        return self.take_turn(agent_utterance)["text"]
-
-
-def build_brain(kind: str, persona: Persona, goal: str, seed: int) -> PersonaBrain:
-    if kind == "scripted":
-        return ScriptedBrain(persona, goal, seed)
-    if kind == "llm":
-        return LLMBrain(persona, goal, seed)
-    raise ValueError(f"unknown brain kind {kind!r} (expected 'scripted' or 'llm')")
+def build_brain(persona: Persona, goal: str, seed: int, **kwargs: Any) -> PersonaBrain:
+    return LLMBrain(persona, goal, seed, **kwargs)

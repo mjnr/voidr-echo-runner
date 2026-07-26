@@ -81,6 +81,31 @@ def test_process_deterministic_per_seed():
     assert a != c  # ambience noise differs per seed
 
 
+@pytest.mark.parametrize(
+    "partitions",
+    [
+        [1, 7, 319, 640, 5, 1024],
+        [640, 640, 640],
+        [13, 29, 47, 83, 131],
+    ],
+)
+def test_streaming_is_bit_exact_across_chunk_boundaries(partitions):
+    pcm = tone_pcm(997, seconds=0.37)
+    expected = _fx("office", seed=91).process(pcm)
+    fx = _fx("office", seed=91)
+    chunks = []
+    offset = 0
+    for size in partitions:
+        if offset >= len(pcm):
+            break
+        chunks.append(fx.process_stream(pcm[offset : offset + size]))
+        offset += size
+    chunks.append(fx.process_stream(pcm[offset:]))
+    chunks.append(fx.process_stream(b"", final=True))
+    assert b"".join(chunks) == expected
+    assert len(expected) == len(pcm)
+
+
 def test_process_disabled_is_passthrough():
     fx = TelephoneChannelFx(
         AmbienceConfig(preset="none", level=1.0), seed=1, sample_rate=SAMPLE_RATE

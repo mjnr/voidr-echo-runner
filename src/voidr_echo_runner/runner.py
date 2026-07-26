@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from .brain import PersonaBrain
+from .brain import HiveError, PersonaBrain
 from .classifier import KeywordStateClassifier
 from .evaluator import TrajectoryEntry
 from .flows import JourneyFlow
@@ -30,6 +30,8 @@ class CallResult:
     agent_turns: int = 0
     end_reason: str | None = None
     transport_error: str | None = None
+    failure_status: str | None = None
+    ai_error: dict[str, Any] | None = None
     started_at_ms: int = 0
     ended_at_ms: int = 0
 
@@ -80,7 +82,12 @@ class CallRunner:
             self.live.on_timeline_event(event_type, data)
 
     def _record_transcript(
-        self, speaker: str, text: str, state: str | None = None, source: str | None = None
+        self,
+        speaker: str,
+        text: str,
+        state: str | None = None,
+        source: str | None = None,
+        provenance: dict[str, Any] | None = None,
     ) -> None:
         entry: dict[str, Any] = {
             "index": len(self.result.transcript),
@@ -92,6 +99,9 @@ class CallRunner:
             entry["state"] = state
         if source is not None:
             entry["source"] = source
+        if provenance is not None:
+            entry.update(provenance)
+            entry["provenance"] = dict(provenance)
         self.result.transcript.append(entry)
         if self.live is not None:
             self.live.on_transcript(entry)
@@ -102,10 +112,43 @@ class CallRunner:
             await self.transport.connect()
             self._record_event("connected", target=getattr(self.transport, "url", "?"))
             await self._loop()
+        except HiveError as exc:
+            self.result.transport_error = f"HiveError: {exc}"
+            self.result.failure_status = exc.outcome
+            self.result.ai_error = {
+                "component": "hive",
+                "outcome": exc.outcome,
+                "turnId": exc.turn_id,
+                "statusCode": exc.status_code,
+                "code": exc.code or "hive_error",
+            }
+            self.result.end_reason = "hive_error"
+            self._record_event(
+                "hive_generation_failed",
+                **self.result.ai_error,
+            )
         except Exception as exc:  # noqa: BLE001 — reported in the result, not raised
             self.result.transport_error = f"{type(exc).__name__}: {exc}"
             self._record_event("error", message=self.result.transport_error)
         finally:
+            cleanup_error: Exception | None = None
+            for name, kwargs in (
+                ("finish_audio", {"sample_rate": 16_000}),
+                ("hangup", {}),
+                ("close", {}),
+            ):
+                action = getattr(self.transport, name, None)
+                if action is None:
+                    continue
+                try:
+                    await action(**kwargs)
+                except Exception as exc:  # noqa: BLE001 - continue remaining cleanup
+                    cleanup_error = cleanup_error or exc
+            if cleanup_error is not None and self.result.transport_error is None:
+                self.result.transport_error = (
+                    f"cleanup {type(cleanup_error).__name__}: {cleanup_error}"
+                )
+                self._record_event("error", message=self.result.transport_error)
             self.result.ended_at_ms = self._now_ms()
         return self.result
 
@@ -239,18 +282,42 @@ class CallRunner:
 
         plan = None
         if self.humanizer is not None:
-            plan = self.humanizer.plan_turn(text)
+            plan = self.humanizer.plan_turn(
+                text,
+                emotion=(self.emotional.emotion if self.emotional is not None else None),
+                emotion_intensity=(
+                    self.emotional.intensity if self.emotional is not None else None
+                ),
+            )
             if plan.directives and hasattr(self.brain, "turn_directives"):
                 self.brain.turn_directives = list(plan.directives)
 
-        reply = self.brain.reply(text)
+        turn = self.brain.take_turn(text)
+        reply = turn["text"]
+        # Real v3 responses carry the canonical nested DTO. The top-level
+        # fallback keeps older test/custom PersonaBrain implementations
+        # compatible without weakening LLMBrain's strict response validation.
+        nested = turn.get("provenance")
+        provenance = dict(nested) if isinstance(nested, dict) else {
+            key: turn[key]
+            for key in (
+                "source",
+                "turnId",
+                "promptVersion",
+                "modelVersion",
+                "modelHash",
+                "policyVersion",
+            )
+            if key in turn
+        }
+        trace = turn.get("trace")
+        runner_trace = dict(trace) if isinstance(trace, dict) else {}
+        if runner_trace:
+            # The voice-session service contract persists validated trace
+            # correlation inside provenance (not as a transcript sibling).
+            provenance["trace"] = runner_trace
 
         if self.humanizer is not None and plan is not None:
-            if plan.memory_lapse and not hasattr(self.brain, "turn_directives"):
-                # ScriptedBrain has no prompt — prefix the hesitation locally.
-                prefix = self.humanizer.scripted_prefix(plan)
-                if prefix:
-                    reply = prefix + reply[0].lower() + reply[1:] if reply else prefix
             # {{massa.*}} placeholders become real values OUTSIDE the LLM;
             # persisted artifacts are redacted later (deny-list covers them).
             reply = self.humanizer.finalize_reply(reply)
@@ -277,7 +344,21 @@ class CallRunner:
                     record_silence(delay_s)
                 await asyncio.sleep(delay_s)
 
-        self._record_transcript("tester", reply)
-        self._record_event("tester_turn", turn=self._turn)
+        self._record_transcript(
+            "tester",
+            reply,
+            source="hive-llm",
+            provenance=provenance,
+        )
+        self._record_event(
+            "tester_turn",
+            turn=self._turn,
+            source="hive-llm",
+            turnId=provenance["turnId"],
+            promptVersion=provenance["promptVersion"],
+            modelVersion=provenance["modelVersion"],
+            policyVersion=provenance["policyVersion"],
+            trace=runner_trace,
+        )
         await self.transport.send_text(reply)
         self._last_reply_monotonic = time.monotonic()

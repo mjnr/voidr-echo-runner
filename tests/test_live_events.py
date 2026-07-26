@@ -180,6 +180,47 @@ def test_agent_audio_waits_for_the_turn_event():
     assert audio["data"]["speaker"] == "agent"
 
 
+def test_sensitive_audio_is_silenced_and_safe_speech_is_preserved():
+    server = FakeServer()
+    session = RedactionSession(deny={"CUSTOMER_CPF": "39053344705"})
+    pub = make_publisher(
+        server,
+        redact=session.redact_deny,
+        has_sensitive_data=lambda text: bool(session.find_spans(text)),
+    )
+    sensitive_pcm = b"\x11\x22" * 320
+    safe_pcm = b"\x33\x44" * 320
+
+    async def _go():
+        await pub.start()
+        pub.on_transcript(
+            {
+                "index": 1,
+                "speaker": "tester",
+                "text": "meu CPF é 390 533 447 05",
+                "ts": 0,
+            }
+        )
+        pub.add_turn_audio("tester", sensitive_pcm, 16000)
+        pub.on_transcript(
+            {"index": 2, "speaker": "tester", "text": "quero consultar o saldo", "ts": 0}
+        )
+        pub.add_turn_audio("tester", safe_pcm, 16000)
+        await pub.stop()
+
+    run(_go())
+    audio_events = [e for e in server.events if e["type"] == "turn_audio"]
+
+    def pcm(event):
+        raw = base64.b64decode(event["data"]["audioB64"])
+        with wave.open(io.BytesIO(raw), "rb") as wav:
+            return wav.readframes(wav.getnframes())
+
+    assert pcm(audio_events[0]) != sensitive_pcm
+    assert pcm(audio_events[0]) == b"\x00" * len(sensitive_pcm)
+    assert pcm(audio_events[1]) == safe_pcm
+
+
 def test_audio_suppressed_when_disabled():
     server = FakeServer()
     pub = make_publisher(server, audio_enabled=False)
@@ -214,6 +255,40 @@ def test_turn_text_passes_massa_deny_list():
     turn = next(e for e in server.events if e["type"] == "turn")
     assert "919021552" not in turn["data"]["text"]
     assert "[MASSA_MOCK_ACCESS_CODE]" in turn["data"]["text"]
+
+
+def test_turn_text_redacts_generic_cpf_email_phone_and_silences_audio():
+    server = FakeServer()
+    session = RedactionSession()
+    pub = make_publisher(
+        server,
+        redact=session.redact,
+        has_sensitive_data=lambda text: bool(session.find_spans(text)),
+    )
+    clear = (
+        "CPF 390.533.447-05, email marcia.real@example.com, "
+        "telefone (31) 98888-7777"
+    )
+    pcm = b"\x21\x43" * 160
+
+    async def _go():
+        await pub.start()
+        pub.on_transcript({"index": 0, "speaker": "tester", "text": clear, "ts": 0})
+        pub.add_turn_audio("tester", pcm, 16000)
+        await pub.stop()
+
+    run(_go())
+    turn = next(e for e in server.events if e["type"] == "turn")
+    for sensitive in ("390.533.447-05", "marcia.real@example.com", "(31) 98888-7777"):
+        assert sensitive not in turn["data"]["text"]
+    assert "[CPF_1]" in turn["data"]["text"]
+    assert "[EMAIL_1]" in turn["data"]["text"]
+    assert "[TELEFONE_1]" in turn["data"]["text"]
+
+    audio = next(e for e in server.events if e["type"] == "turn_audio")
+    raw = base64.b64decode(audio["data"]["audioB64"])
+    with wave.open(io.BytesIO(raw), "rb") as wav:
+        assert wav.readframes(wav.getnframes()) == b"\x00" * len(pcm)
 
 
 def test_dtmf_digits_pass_deny_list():
@@ -340,15 +415,25 @@ def test_call_runner_hooks_feed_the_publisher(monkeypatch):
     from pathlib import Path
 
     from voidr_echo_runner.flows import load_journey_flow
-    from voidr_echo_runner.models import VoiceTestCase, load_persona_catalog
-    from voidr_echo_runner.brain import build_brain
+    from voidr_echo_runner.models import VoiceTestCase
     from voidr_echo_runner.runner import CallRunner
 
     repo = Path(__file__).resolve().parents[1]
     case = VoiceTestCase.load(repo / "cases" / "consulta-saldo-tc-001.yaml")
     flow = load_journey_flow(repo / "flows" / "consulta-saldo-v1.json")
-    persona = load_persona_catalog(repo / "personas" / "catalog.yaml")[case.persona.base]
-    brain = build_brain("scripted", persona, case.goal, 42)
+    class FakeHiveBrain:
+        def take_turn(self, text):
+            return {
+                "text": "Quero consultar meu saldo.",
+                "source": "hive-llm",
+                "turnId": "turn-test",
+                "promptVersion": "test",
+                "modelVersion": "test",
+                "policyVersion": "test",
+                "trace": {"promptHash": "test", "completionId": "test"},
+            }
+
+    brain = FakeHiveBrain()
 
     class ScriptedTransport:
         url = "ws://fake"
@@ -394,7 +479,38 @@ def test_call_runner_hooks_feed_the_publisher(monkeypatch):
     assert phases == ["dialing", "ura", "agent", "ended"]
     speakers = [e["data"]["speaker"] for e in server.events if e["type"] == "turn"]
     assert "ura" in speakers and "agent" in speakers and "tester" in speakers
-    # every turn respects the contract shape
+    # Tester turns carry Hive provenance; remote turns keep the base shape.
     for e in server.events:
         if e["type"] == "turn":
-            assert set(e["data"]) == {"speaker", "text", "turnIndex"}
+            if e["data"]["speaker"] == "tester":
+                assert e["data"]["source"] == "hive-llm"
+                assert e["data"]["turnId"] == "turn-test"
+            else:
+                assert {"speaker", "text", "turnIndex"} <= set(e["data"])
+
+
+def test_hive_failure_is_published_with_structured_outcome():
+    server = FakeServer()
+    pub = make_publisher(server)
+
+    async def _go():
+        await pub.start()
+        pub.on_timeline_event(
+            "hive_turn_failed",
+            {
+                "turnId": "turn-failed",
+                "code": "UPSTREAM_UNAVAILABLE",
+                "statusCode": 502,
+                "outcome": "degraded",
+            },
+        )
+        await pub.stop()
+
+    run(_go())
+    failure = next(e for e in server.events if e["type"] == "hive_generation_failed")
+    assert failure["data"] == {
+        "turnId": "turn-failed",
+        "code": "UPSTREAM_UNAVAILABLE",
+        "statusCode": 502,
+        "outcome": "degraded",
+    }

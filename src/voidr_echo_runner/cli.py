@@ -17,6 +17,7 @@ from .brain import build_brain
 from .evaluator import evaluate_trajectory
 from .flows import load_journey_flow
 from .models import VoiceTestCase, load_persona_catalog
+from .projected_secrets import load_projected_secrets
 from .runner import CallRunner
 from .transport import build_transport
 
@@ -25,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 
 def main(argv: list[str] | None = None) -> None:
     load_dotenv(REPO_ROOT / ".env")  # local credentials; never committed
+    load_projected_secrets()
     parser = argparse.ArgumentParser(prog="echo-runner", description=__doc__)
     parser.add_argument("--version", action="version", version=__version__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -34,7 +36,6 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--target", required=True, help="ws://host:port/ws (mock) or tel:+E164 (Twilio stub)")
     run.add_argument("--seed", type=int, default=None, help="override persona variant_seed")
     run.add_argument("--mode", choices=("text", "audio"), default="text")
-    run.add_argument("--brain", choices=("scripted", "llm"), default="scripted")
     run.add_argument("--personas", type=Path, default=REPO_ROOT / "personas" / "catalog.yaml")
     run.add_argument("--out", type=Path, default=Path("out"))
     run.add_argument("--run-id", default=None)
@@ -74,7 +75,6 @@ def main(argv: list[str] | None = None) -> None:
     chat.add_argument("--personas", type=Path, default=REPO_ROOT / "personas" / "catalog.yaml")
     chat.add_argument("--journey", type=Path, default=None, help="journey flow JSON for state tracking")
     chat.add_argument("--voice", action="store_true", help="speak replies (ElevenLabs + afplay)")
-    chat.add_argument("--escalate", action="store_true", help="always route to the escalation model")
     chat.add_argument("--seed", type=int, default=None, help="best-effort LLM seed")
     chat.add_argument("--goal", default=None, help="persona goal (fills goalTemplate's {goal})")
 
@@ -133,16 +133,15 @@ def _run(args: argparse.Namespace) -> int:
         humanizer = None
         if not args.no_humanize:
             humanizer = Humanizer(persona, seed, massa)
-        brain = build_brain(args.brain, persona, case.goal, seed)
-        if args.brain == "llm":
-            brain.emotional = emotional  # current state injected per turn
-            if massa:
-                brain.personal_data = massa.personal_data_lines()
-            # The history sent to the hive must carry massa as placeholders
-            # (the gateway 422s on clear PII) — share the case deny-list.
-            from .redaction import build_session_for_case
+        brain = build_brain(persona, case.goal, seed)
+        brain.emotional = emotional  # current state injected per turn
+        if massa:
+            brain.personal_data = massa.personal_data_lines()
+        # The history sent to the hive must carry massa as placeholders
+        # (the gateway 422s on clear PII) — share the case deny-list.
+        from .redaction import build_session_for_case
 
-            brain.redaction = build_session_for_case(case)
+        brain.redaction = build_session_for_case(case)
         is_pstn = args.target.startswith(("tel:", "+"))
         if is_pstn and args.mode != "audio":
             raise RuntimeError("tel: targets are audio-only — run with --mode audio")
@@ -194,13 +193,16 @@ def _run(args: argparse.Namespace) -> int:
             from .live_events import LivePublisher
             from .redaction import build_session_for_case as _build_deny
 
+            live_redaction = _build_deny(case)
             live = LivePublisher(
                 api_url,
                 os.environ.get("EXECUTION_ID") or run_id,
                 1,
                 token=os.environ.get("VOIDR_ACCESS_TOKEN"),
-                # live text passes the massa deny-list even with --no-redaction
-                redact=_build_deny(case).redact_deny,
+                # Live output always receives full PII + massa redaction, even
+                # when local persisted artifacts use --no-redaction.
+                redact=live_redaction.redact,
+                has_sensitive_data=lambda text: bool(live_redaction.find_spans(text)),
                 audio_enabled=os.environ.get("ECHO_LIVE_AUDIO", "1") != "0",
             )
             if args.mode == "audio":
@@ -246,9 +248,7 @@ def _run(args: argparse.Namespace) -> int:
         "runnerVersion": __version__,
         "mode": args.mode,
         "target": args.target,
-        # Which brain produced the tester turns — llm sessions are the
-        # trigger for the service's persona-fidelity judge (P0.4).
-        "brain": args.brain,
+        "brain": "hive-llm",
     }
     if humanizer is not None:
         meta["humanize"] = humanizer.config_record()

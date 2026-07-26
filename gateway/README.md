@@ -26,7 +26,7 @@ segundos).
                        │  pareia por {token} e faz  │   + Service/Ingress TLS
                        │  proxy cego bidirecional   │
                        └─────────────▲──────────────┘
-                                     │ ws (OUTBOUND do pod)
+                                     │ wss (OUTBOUND do pod)
                      /runner/{token} │ Authorization: Bearer <secret>
                        ┌─────────────┴──────────────┐
                        │  voidr-echo-runner (pod)   │   GKE Job por shard
@@ -49,11 +49,38 @@ não tem como carregar auth (Media Streams não envia headers custom), então a
 proteção é o token de chamada não-adivinhável, com vida amarrada à conexão
 do runner. Frames de mídia nunca são logados.
 
+## Voice provider gateway
+
+O mesmo processo pode expor transporte de capability, mas todo upstream é
+LiteLLM:
+
+- `WS /v1/stt/litellm`: recebe um utterance PCM e encaminha multipart para
+  `/audio/transcriptions`.
+- `WS /v1/tts/litellm`: devolve chunks encaminhados de `/audio/speech`,
+  terminando com `{"type":"end","chunks":N}`.
+
+Essas rotas exigem `Authorization: Bearer <capability>` e
+`X-Voice-Request-Id`. A capability compacta HMAC-SHA256 contém `org`,
+`execution`, `shard`, `providers`, `models`, `voices`, `iat`, `exp`, `jti` e
+`max_requests`. Assinatura, expiração, allowlists não vazias de modelos e voice
+IDs por provider, escopo, nonce/replay e limite de usos são validados antes de abrir
+chamada ao LiteLLM. Replay, limite de usos, token bucket de CPS e
+semáforo de concorrência por organização/provider usam operações Lua atômicas
+no Redis compartilhado, com TTL/leases renováveis. Falha do Redis fecha o
+acesso em produção.
+
+Logs de auditoria contêm somente tags (`org`, `execution`, `shard`, `provider`,
+`model`), status, código de erro, duração e número de chunks. Áudio, texto,
+transcript, tokens e chaves nunca são logados. Métricas estão em `/metrics`.
+
 ## Rodar local
 
 ```bash
 uv sync
-ECHO_MEDIA_GATEWAY_AUTH_TOKEN=dev-secret uv run echo-media-gateway
+ECHO_RUNTIME_ENV=local \
+VOICE_GATEWAY_STATE_BACKEND=memory \
+ECHO_MEDIA_GATEWAY_AUTH_TOKEN=dev-secret \
+uv run echo-media-gateway
 # healthcheck: curl http://localhost:8991/healthz
 ```
 
@@ -65,15 +92,45 @@ runner em Docker): `../scripts/prove-gateway-e2e.sh` (ver docs/CLOUD-EXECUTION.m
 | Env | Default | Descrição |
 |---|---|---|
 | `ECHO_MEDIA_GATEWAY_PORT` | `8991` | Porta de escuta |
-| `ECHO_MEDIA_GATEWAY_AUTH_TOKEN` | *(vazio)* | Shared secret exigido em `/runner/{token}`. Sem ele o gateway roda aberto — **só dev** |
+| `ECHO_RUNTIME_ENV` | *(obrigatório)* | `local/dev/test` ou `cloud/staging/prod/production` |
+| `ECHO_MEDIA_GATEWAY_AUTH_TOKEN` | *(obrigatório)* | Shared secret de `/runner/{token}`; mínimo 32 bytes em produção |
+| `ECHO_MEDIA_GATEWAY_ALLOW_INSECURE_RUNNER_AUTH` | `0` | Opt-in `1` sem auth, somente em local/dev/test |
+| `VOICE_GATEWAY_SIGNING_SECRET` | *(obrigatório fora de local/dev/test)* | Chave HMAC para validar capabilities efêmeras (mínimo 32 bytes) |
+| `VOICE_GATEWAY_STATE_BACKEND` | *(obrigatório)* | `redis` em produção; `memory` somente explicitamente em local/test |
+| `VOICE_GATEWAY_ENABLED_PROVIDERS` | *(obrigatório para readiness)* | Deve ser exatamente `litellm` |
+| `REDIS_HOST` / `REDIS_PORT` | *(somente local/test)* | Redis plaintext para desenvolvimento |
+| `REDIS_URL` | *(obrigatório em produção)* | `rediss://` com certificado e hostname validados; estado, leases e relay Pub/Sub compartilhados entre réplicas |
+| `LITELLM_BASE_URL` | *(obrigatório)* | Endpoint interno do LiteLLM |
+| `LITELLM_API_KEY` | *(obrigatório)* | Virtual key restrita aos aliases Echo |
+| `LITELLM_TTS_MODEL` | *(obrigatório)* | Alias TTS imutável e pinado |
+| `LITELLM_STT_MODEL` | *(obrigatório)* | Alias STT imutável e pinado |
 
 ## Envs (runner, via ENVIRONMENT_PARAMS ou processo)
 
 | Env | Descrição |
 |---|---|
 | `ECHO_MEDIA_GATEWAY_URL` | Base pública `wss://` usada no TwiML (`/twilio/{token}`) — liga o modo gateway |
-| `ECHO_MEDIA_GATEWAY_RUNNER_URL` | Base interna para o registro outbound do runner (ex.: `ws://echo-media-gateway.voidr-runners.svc.cluster.local:8991`); default = a pública |
+| `ECHO_MEDIA_GATEWAY_RUNNER_URL` | Base de registro outbound; em produção deve ser `wss://`, sem downgrade; default = a pública |
 | `ECHO_MEDIA_GATEWAY_TOKEN` | Shared secret do registro (par do `ECHO_MEDIA_GATEWAY_AUTH_TOKEN`) |
+| `LITELLM_BASE_URL` | Gateway único de text/image/audio |
+| `LITELLM_API_KEY` | Virtual key org-scoped entregue em envelope de uso único |
+| `LITELLM_TTS_MODEL` / `LITELLM_STT_MODEL` | Aliases pinados |
+
+Chamadas diretas a Deepgram/ElevenLabs só são aceitas com
+`ECHO_RUNTIME_ENV=local|dev` **e** `VOICE_ALLOW_DIRECT_PROVIDERS=1`.
+
+## Benchmark TTS
+
+O script `../scripts/benchmark_voice_tts.py` mede por amostra TTFB, latência
+total, chunks, bytes, erros e uma verificação estrutural de áudio não vazio:
+
+```bash
+LITELLM_BASE_URL=https://... LITELLM_API_KEY=... \
+  uv run python scripts/benchmark_voice_tts.py --voice VOICE_ID --runs 20
+```
+
+A virtual key precisa permitir os aliases Echo pinados. O relatório compara
+contra um JSON baseline; não existe fallback direto em produção.
 
 ## Deploy K8s (exemplo)
 

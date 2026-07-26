@@ -119,7 +119,7 @@ def test_plan_turn_emits_directive_with_placeholder_on_data_request():
     hum = Humanizer(marcia(), 7, _massa_full())
     plan = hum.plan_turn("Para localizar seu cadastro, me informa o seu CPF?")
     assert plan.directives, "data request must produce a directive"
-    assert "{{massa.cpf}}" in plan.directives[0]
+    assert any("{{massa.cpf}}" in directive for directive in plan.directives)
     assert "390" not in " ".join(plan.directives)  # value never reaches the LLM
 
 
@@ -138,7 +138,7 @@ def test_second_request_of_same_datum_never_lapses_again():
         if first.memory_lapse:
             again = hum.plan_turn("Pode repetir o CPF, por gentileza?")
             assert not again.memory_lapse
-            assert "em mãos" in again.directives[0]
+            assert any("em mãos" in directive for directive in again.directives)
             return
     pytest.fail("no seed in 0..49 produced a CPF lapse for Márcia (58y)")
 
@@ -147,7 +147,8 @@ def test_plan_turn_ignores_categories_without_massa():
     massa = MassaFacts.from_params({"ECHO_MASSA": '{"cpf": "390.533.447-05"}'})
     hum = Humanizer(marcia(), 7, massa)
     plan = hum.plan_turn("Qual a sua data de nascimento?")
-    assert plan.directives == [] and not plan.memory_lapse
+    assert not plan.memory_lapse
+    assert not any("{{massa." in directive for directive in plan.directives)
 
 
 def test_finalize_reply_substitutes_massa():
@@ -155,15 +156,6 @@ def test_finalize_reply_substitutes_massa():
     out = hum.finalize_reply("ah achei... é {{massa.cpf}}, viu?")
     assert out == "ah achei... é 390.533.447-05, viu?"
     assert hum.substituted_keys == ["cpf"]
-
-
-def test_scripted_prefix_only_on_lapse():
-    hum = Humanizer(marcia(), 7, _massa_full())
-    from voidr_echo_runner.humanize import TurnPlan
-
-    assert hum.scripted_prefix(TurnPlan()) == ""
-    prefix = hum.scripted_prefix(TurnPlan(memory_lapse=True))
-    assert prefix.strip()
 
 
 # --- Humanizer: timing ------------------------------------------------------------
@@ -234,15 +226,24 @@ class _FakeTransport:
         self.silences.append(seconds)
 
 
-class _EchoBrain:
-    """Deterministic brain that mimics an LLM speaking the placeholder."""
-
+class _FakeHiveBrain:
     turn_directives: list[str] = []
 
-    def reply(self, agent_text):
-        if self.turn_directives:
-            return "Ai peraí... deixa eu pegar aqui... pronto: {{massa.cpf}}."
-        return "Oi, quero a segunda via da minha conta."
+    def take_turn(self, agent_text):
+        text = (
+            "Ai peraí... deixa eu pegar aqui... pronto: {{massa.cpf}}."
+            if self.turn_directives
+            else "Oi, quero a segunda via da minha conta."
+        )
+        return {
+            "text": text,
+            "source": "hive-llm",
+            "turnId": "fake-turn",
+            "promptVersion": "test",
+            "modelVersion": "test",
+            "policyVersion": "test",
+            "trace": {"promptHash": "test", "completionId": "test"},
+        }
 
 
 def test_runner_substitutes_massa_and_records_humanized_turn(monkeypatch):
@@ -265,7 +266,7 @@ def test_runner_substitutes_massa_and_records_humanized_turn(monkeypatch):
         marcia(), 7, MassaFacts.from_params({"ECHO_MASSA": '{"cpf": "390.533.447-05"}'})
     )
     monkeypatch.setattr(hum, "reply_delay_s", lambda *a, **k: 0.01)
-    runner = CallRunner(case, flow, _EchoBrain(), transport, humanizer=hum)
+    runner = CallRunner(case, flow, _FakeHiveBrain(), transport, humanizer=hum)
     result = asyncio.run(runner.run())
 
     assert result.transport_error is None

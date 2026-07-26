@@ -10,8 +10,9 @@
 # voidr-service NÃO seta `command` — o contrato inteiro chega por env vars
 # (VOIDR_API_URL, EXECUTION_ID, VOIDR_ORG_ID, VOIDR_CLIENT_ID/SECRET ou
 # VOIDR_ACCESS_TOKEN, SHARDS_CURRENT/TOTAL, ENVIRONMENT_PARAMS). Secrets de
-# mídia (TWILIO_*/DEEPGRAM_*/ELEVENLABS_*/ECHO_*/HIVE_*) viajam dentro de
-# ENVIRONMENT_PARAMS e são promovidos a os.environ pelo próprio runner.
+# plataforma (gateway/Hive/Twilio e tokens) são injetados diretamente pelo
+# service. ENVIRONMENT_PARAMS contém apenas dados/configuração do cliente e
+# nunca pode sobrescrever essas coordenadas governadas.
 
 # ── estágio 1: resolve dependências e instala o projeto ─────────────────────
 FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder

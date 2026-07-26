@@ -152,6 +152,8 @@ def test_redact_call_audio_discards_raw_by_default(recorder, tmp_path, monkeypat
 
 def test_redact_call_audio_keeps_raw_when_env_set(recorder, tmp_path, monkeypatch):
     monkeypatch.setenv("ECHO_KEEP_RAW_AUDIO", "1")
+    monkeypatch.setenv("ECHO_RUNTIME_ENV", "local")
+    monkeypatch.setenv("ECHO_ALLOW_LOCAL_RAW_AUDIO", "1")
     session = RedactionSession()
     meta = redact_call_audio(
         recorder, [(1, "tester", f"meu CPF é {CPF} tá")], session, tmp_path,
@@ -159,3 +161,29 @@ def test_redact_call_audio_keeps_raw_when_env_set(recorder, tmp_path, monkeypatc
     )
     assert (tmp_path / "call.wav").exists()
     assert meta["rawWavKept"] is True
+
+
+@pytest.mark.parametrize("runtime", ["", "cloud", "staging", "prod", "production"])
+def test_raw_audio_retention_fails_closed_outside_local_dev(
+    recorder, tmp_path, monkeypatch, runtime
+):
+    monkeypatch.setenv("ECHO_KEEP_RAW_AUDIO", "1")
+    monkeypatch.setenv("ECHO_ALLOW_LOCAL_RAW_AUDIO", "1")
+    if runtime:
+        monkeypatch.setenv("ECHO_RUNTIME_ENV", runtime)
+    else:
+        monkeypatch.delenv("ECHO_RUNTIME_ENV", raising=False)
+
+    with pytest.raises(RuntimeError, match="requires ECHO_RUNTIME_ENV"):
+        redact_call_audio(recorder, [], RedactionSession(), tmp_path, words_fn=lambda *_: [])
+
+
+def test_raw_audio_retention_requires_explicit_local_opt_in(
+    recorder, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("ECHO_KEEP_RAW_AUDIO", "1")
+    monkeypatch.setenv("ECHO_RUNTIME_ENV", "dev")
+    monkeypatch.delenv("ECHO_ALLOW_LOCAL_RAW_AUDIO", raising=False)
+
+    with pytest.raises(RuntimeError, match="ECHO_ALLOW_LOCAL_RAW_AUDIO"):
+        redact_call_audio(recorder, [], RedactionSession(), tmp_path, words_fn=lambda *_: [])

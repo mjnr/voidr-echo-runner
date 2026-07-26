@@ -1,25 +1,42 @@
 # voidr echo media gateway — manifests de EXEMPLO (ajuste projeto/domínio).
 #
 # Notas de rollout:
-# - 1 réplica é suficiente para o volume atual (frames ~400B/20ms por
-#   chamada). O pareamento runner↔Twilio é em memória: com réplicas > 1 as
-#   duas pontas do MESMO token precisam cair na MESMA réplica — use nginx
-#   ingress com `nginx.ingress.kubernetes.io/upstream-hash-by: "$request_uri"`
-#   (o token está no path das duas pontas... /runner/{t} e /twilio/{t} têm
-#   paths DIFERENTES; para hash consistente normalize com
-#   upstream-hash-by: "$arg_call" ou um snippet que extraia o último
-#   segmento). Enquanto isso: replicas: 1 + PodDisruptionBudget.
+# - O relay runner↔Twilio usa leases e Pub/Sub no Redis compartilhado; as
+#   pontas podem cair em réplicas diferentes sem sessionAffinity.
 # - On-demand (sem Spot): o gateway carrega chamadas em curso.
 # - Timeout de backend LONGO: uma chamada dura minutos; o default de 30s do
 #   GCLB mataria o WSS no meio (BackendConfig.timeoutSec).
+# - Credenciais são arquivos read-only do CSI; não há Kubernetes Secret nem
+#   secretKeyRef/env secret. O bootstrap do gateway lê VOIDR_SECRET_DIR.
 apiVersion: v1
-kind: Secret
+kind: ServiceAccount
 metadata:
   name: echo-media-gateway
   namespace: voidr-runners
-type: Opaque
-stringData:
-  ECHO_MEDIA_GATEWAY_AUTH_TOKEN: "TROQUE-POR-UM-SECRET-FORTE"
+  annotations:
+    iam.gke.io/gcp-service-account: voidr-prod-echo-gateway@PROJETO.iam.gserviceaccount.com
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: voidr-prod-echo-gateway
+  namespace: voidr-runners
+spec:
+  provider: gke
+  parameters:
+    secrets: |
+      - resourceName: "projects/PROJETO/secrets/voidr-prod-echo-media-gateway-token/versions/latest"
+        path: "ECHO_MEDIA_GATEWAY_AUTH_TOKEN"
+      - resourceName: "projects/PROJETO/secrets/voidr-prod-echo-gateway-signing/versions/latest"
+        path: "VOICE_GATEWAY_SIGNING_SECRET"
+      - resourceName: "projects/PROJETO/secrets/voidr-prod-echo-gateway-metrics/versions/latest"
+        path: "VOICE_GATEWAY_METRICS_TOKEN"
+      - resourceName: "projects/PROJETO/secrets/voidr-prod-echo-litellm-url/versions/latest"
+        path: "LITELLM_BASE_URL"
+      - resourceName: "projects/PROJETO/secrets/voidr-prod-echo-litellm-key/versions/latest"
+        path: "LITELLM_API_KEY"
+      - resourceName: "projects/PROJETO/secrets/voidr-prod-platform-redis-url/versions/latest"
+        path: "REDIS_URL"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -28,27 +45,83 @@ metadata:
   namespace: voidr-runners
   labels: { app: echo-media-gateway }
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels: { app: echo-media-gateway }
   template:
     metadata:
       labels: { app: echo-media-gateway }
     spec:
+      serviceAccountName: echo-media-gateway
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app: echo-media-gateway }
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels: { app: echo-media-gateway }
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels: { app: echo-media-gateway }
       containers:
         - name: gateway
-          image: southamerica-east1-docker.pkg.dev/PROJETO/REPO/echo-media-gateway:TAG
+          image: southamerica-east1-docker.pkg.dev/PROJETO/REPO/echo-media-gateway@sha256:0000000000000000000000000000000000000000000000000000000000000000
           ports: [{ containerPort: 8991 }]
-          envFrom:
-            - secretRef: { name: echo-media-gateway }
+          env:
+            - { name: ECHO_RUNTIME_ENV, value: production }
+            - { name: VOICE_GATEWAY_STATE_BACKEND, value: redis }
+            - { name: VOICE_GATEWAY_ENABLED_PROVIDERS, value: "litellm" }
+            - { name: LITELLM_TTS_MODEL, value: "echo-tts-elevenlabs-flash-v2-5@id:2026-07-26" }
+            - { name: LITELLM_STT_MODEL, value: "echo-stt-deepgram-nova-2@id:2026-07-26" }
+            - { name: VOIDR_SECRET_DIR, value: /var/run/secrets/voidr }
+          volumeMounts:
+            - name: gateway-secrets
+              mountPath: /var/run/secrets/voidr
+              readOnly: true
           readinessProbe:
-            httpGet: { path: /healthz, port: 8991 }
+            httpGet: { path: /readyz, port: 8991 }
+            timeoutSeconds: 2
+            periodSeconds: 5
+            failureThreshold: 3
           livenessProbe:
             httpGet: { path: /healthz, port: 8991 }
+            timeoutSeconds: 2
             periodSeconds: 30
+            failureThreshold: 3
+          startupProbe:
+            httpGet: { path: /healthz, port: 8991 }
+            timeoutSeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
           resources:
             requests: { cpu: 100m, memory: 128Mi }
             limits: { memory: 256Mi }
+      volumes:
+        - name: gateway-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: voidr-prod-echo-gateway
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: echo-media-gateway
+  namespace: voidr-runners
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app: echo-media-gateway }
 ---
 apiVersion: cloud.google.com/v1
 kind: BackendConfig

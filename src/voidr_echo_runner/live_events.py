@@ -6,9 +6,9 @@ AudioTransportAdapter utterances) and POSTs batched events to the service:
     POST {VOIDR_API_URL}/v1/echo/live/{executionId}/events
     body: {"shardIndex": N, "events": [{"seq", "tsMs", "type", "data"}]}
 
-Contract (fixed — the service/UI are built against these exact fields):
+Contract:
   phase            {phase: dialing|ura|agent|ended}
-  turn             {speaker: tester|agent|ura, text, turnIndex}
+  turn             {speaker, text, turnIndex, source?, turnId?, provenance?}
   turn_audio       {speaker, turnIndex, format: "wav", sampleRate, audioB64}
   dtmf_sent        {digits}
   state_transition {state, turn}
@@ -18,9 +18,9 @@ Contract (fixed — the service/UI are built against these exact fields):
 Fire-and-forget by design: a network failure NEVER blocks or kills the call.
 Batches are retried a couple of times and then dropped; a simple circuit
 breaker disables the publisher when the endpoint 404s (not deployed yet) or
-stays unreachable. Turn TEXT goes through the massa deny-list before leaving
-the process; live audio is NOT redacted (see README — disable it with
-ECHO_LIVE_AUDIO=0 on calls that use real sensitive massas).
+stays unreachable. Turn text goes through the massa deny-list before leaving
+the process. Audio remains enabled, but any utterance whose paired text
+contains massa/PII is replaced with equal-duration silence before publication.
 """
 
 from __future__ import annotations
@@ -65,6 +65,7 @@ class LivePublisher:
         *,
         token: str | None = None,
         redact: Callable[[str], str] | None = None,
+        has_sensitive_data: Callable[[str], bool] | None = None,
         audio_enabled: bool = True,
         client: httpx.AsyncClient | None = None,
         sync_client: httpx.Client | None = None,
@@ -73,6 +74,7 @@ class LivePublisher:
         self.shard_index = shard_index
         self.audio_enabled = audio_enabled
         self._redact = redact or (lambda text: text)
+        self._has_sensitive_data = has_sensitive_data
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         self._client = client or httpx.AsyncClient(timeout=POST_TIMEOUT_S, headers=headers)
         self._owns_client = client is None
@@ -97,6 +99,7 @@ class LivePublisher:
         self._last_turn_index: dict[str, int] = {}
         self._audio_attached: set[int] = set()
         self._pending_audio: dict[str, tuple[bytes, int]] = {}
+        self._sensitive_turns: set[int] = set()
 
     # ── emission core ─────────────────────────────────────────────────────────
 
@@ -132,10 +135,36 @@ class LivePublisher:
         elif speaker == "agent":
             self._emit_phase("agent")
         turn_index = entry["index"]
-        self.emit(
-            "turn",
-            {"speaker": speaker, "text": self._redact(entry["text"]), "turnIndex": turn_index},
-        )
+        clear_text = str(entry["text"])
+        redacted_text = self._redact(clear_text)
+        try:
+            sensitive = (
+                self._has_sensitive_data(clear_text)
+                if self._has_sensitive_data is not None
+                else redacted_text != clear_text
+            )
+        except Exception:  # fail closed: detector failure must not leak audio
+            sensitive = True
+        if sensitive:
+            self._sensitive_turns.add(turn_index)
+        event = {
+            "speaker": speaker,
+            "text": redacted_text,
+            "turnIndex": turn_index,
+        }
+        if speaker == "tester":
+            for key in (
+                "source",
+                "turnId",
+                "promptVersion",
+                "modelVersion",
+                "policyVersion",
+                "trace",
+                "provenance",
+            ):
+                if key in entry:
+                    event[key] = entry[key]
+        self.emit("turn", event)
         self._last_turn_index[speaker] = turn_index
         pending = self._pending_audio.pop(speaker, None)
         if pending is not None:
@@ -155,6 +184,16 @@ class LivePublisher:
                     "emotion": data.get("emotion"),
                     "intensity": data.get("intensity"),
                     "action": data.get("action") or None,
+                },
+            )
+        elif event_type in {"hive_generation_failed", "hive_turn_failed"}:
+            self.emit(
+                "hive_generation_failed",
+                {
+                    "turnId": data.get("turnId"),
+                    "code": data.get("code"),
+                    "statusCode": data.get("statusCode"),
+                    "outcome": data.get("outcome"),
                 },
             )
         elif event_type == "call_ended":
@@ -182,6 +221,11 @@ class LivePublisher:
     ) -> None:
         if not self.audio_enabled:
             return
+        if turn_index in self._sensitive_turns:
+            # There is no word-level timing contract between STT/TTS text and
+            # PCM. Silencing the complete paired utterance is the only safe
+            # online redaction that cannot leak a sensitive span.
+            pcm = b"\x00" * len(pcm)
         self._audio_attached.add(turn_index)
         self.emit(
             "turn_audio",

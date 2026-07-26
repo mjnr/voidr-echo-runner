@@ -71,12 +71,12 @@ O playground (echo-playground.service → hive `persona-turn`) sempre usou o
 condicionamento rico (identidade, OCEAN, letramento, vocabulário, probes).
 A execução **não**:
 
-1. **Brain errado por default**: `serve_execution` usava
+1. **Brain errado por default (histórico)**: `serve_execution` usava
    `ECHO_BRAIN=scripted` como default. O `ScriptedBrain` é determinístico
    (goal em 1ª pessoa + reformulação) e ignora temperamento/letramento/
    glossário/emoção — a "persona pragmática" relatada pelo fundador era o
-   scripted brain. **Fix**: default `llm` quando `HIVE_URL`+
-   `HIVE_GATEWAY_TOKEN` existem; fallback scripted com aviso alto.
+   scripted brain. **Estado atual**: removido; Hive `persona-turn/v3` é
+   obrigatório e falhas nunca geram fala tester.
 2. **Sem massa pessoal**: nenhum caminho levava CPF/nascimento à persona —
    ela não tinha O QUE esquecer nem ditar. **Fix**: contrato
    `ENVIRONMENT_PARAMS.ECHO_MASSA` + fallback `identity.facts`, com
@@ -98,8 +98,8 @@ A execução **não**:
 | `8d58783` | **EXEC-REALISM core**: brain LLM default na execução; `humanize.py` (MassaFacts + lapsos + latência gamma); `callfx.py` (banda 300–3400 Hz + µ-law + ambience seedada); runner/audio/cli/service_mode wiring; 40 testes novos |
 | `21d2980` | flow+case `segunda-via-fatura`; persona Márcia com literacy INAF rudimentar + glossaryVocabulary local |
 
-Knobs (ENVIRONMENT_PARAMS ou env): `ECHO_BRAIN` (llm|scripted),
-`ECHO_MASSA` (JSON), `ECHO_HUMAN_REALISM=0`, `ECHO_HUMAN_TIMING=0`,
+Knobs (ENVIRONMENT_PARAMS ou env): `ECHO_MASSA` (JSON),
+`ECHO_HUMAN_REALISM=0`, `ECHO_HUMAN_TIMING=0`,
 `ECHO_CALL_AMBIENCE` (`none|quiet|home|office|street[:level]` ou JSON).
 Tudo determinístico por (persona, seed). CLI: `--ambience`, `--no-humanize`.
 
@@ -116,7 +116,7 @@ Tudo determinístico por (persona, seed). CLI: `--ambience`, `--no-humanize`.
 
 ### voidr-service
 Nenhuma mudança necessária: secrets do environment já fluem genericamente
-para `ENVIRONMENT_PARAMS` (ECHO_CALL_AMBIENCE/ECHO_BRAIN configuráveis por
+para `ENVIRONMENT_PARAMS` (`ECHO_CALL_AMBIENCE` configurável por
 environment secret), e o agente da frente de massa já dispatcha
 `ECHO_MASSA` com o contrato exato que o runner consome
 (`executions.service.ts`, resolução journey massa > seed data > persona).

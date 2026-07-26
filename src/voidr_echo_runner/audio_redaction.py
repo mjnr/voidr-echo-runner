@@ -3,11 +3,12 @@
 Maps the PII text spans found by `redaction.RedactionSession` back to WAV
 intervals and overwrites them with a 1 kHz beep, producing
 `out/<run-id>/call.redacted.wav`. The raw `call.wav` is only kept when
-`ECHO_KEEP_RAW_AUDIO=1` (default: discarded after redaction).
+`ECHO_KEEP_RAW_AUDIO=1` in an explicitly opted-in local/dev runtime only
+(default: discarded after redaction).
 
 Word alignment: the call recording is turn-based (each utterance is a known
 segment of the stereo WAV), so only segments whose text contains PII are
-re-transcribed via the Deepgram prerecorded API (word-level timestamps come
+re-transcribed via LiteLLM /audio/transcriptions (word-level timestamps come
 in the response). This runs POST-call: zero latency added to the live
 conversation, one REST call per PII-bearing segment.
 
@@ -27,11 +28,27 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .redaction import RedactionSession
+from .voice_gateway import resolve_voice_config
+
+_LOCAL_RAW_AUDIO_ENVIRONMENTS = {"local", "dev", "development"}
+
+
+def raw_audio_retention_enabled() -> bool:
+    """Return the local-only raw retention flag, failing closed elsewhere."""
+    if os.environ.get("ECHO_KEEP_RAW_AUDIO") != "1":
+        return False
+    runtime = os.environ.get("ECHO_RUNTIME_ENV", "").strip().lower()
+    opted_in = os.environ.get("ECHO_ALLOW_LOCAL_RAW_AUDIO") == "1"
+    if runtime not in _LOCAL_RAW_AUDIO_ENVIRONMENTS or not opted_in:
+        raise RuntimeError(
+            "ECHO_KEEP_RAW_AUDIO=1 requires ECHO_RUNTIME_ENV=local|dev and "
+            "ECHO_ALLOW_LOCAL_RAW_AUDIO=1"
+        )
+    return True
 
 BEEP_FREQ_HZ = 1000
 BEEP_AMPLITUDE = 8000  # ~25% full scale: audible, not aggressive
 WORD_PAD_S = 0.12  # padding around matched words
-DEEPGRAM_MODEL = "nova-2"
 
 
 @dataclass(frozen=True)
@@ -59,43 +76,63 @@ class RecorderLike(Protocol):
 WordsFn = Callable[[bytes, int], list[Word]]
 
 
-def deepgram_words(pcm: bytes, sample_rate: int) -> list[Word]:
-    """Word-level timestamps from the Deepgram prerecorded API (pt-BR)."""
+def litellm_words(pcm: bytes, sample_rate: int) -> list[Word]:
+    """Word-level timestamps through governed LiteLLM transcription."""
     import httpx
 
+    config = resolve_voice_config()
+    if config.direct or not config.litellm_url or not config.virtual_key or not config.stt_alias:
+        raise RuntimeError("word alignment requires governed LiteLLM configuration")
+    base = config.litellm_url.rstrip("/")
+    path = "/audio/transcriptions" if base.endswith("/v1") else "/v1/audio/transcriptions"
+    tags = ",".join(
+        (
+            f"org:{os.environ.get('VOIDR_ORGANIZATION_ID', 'unknown')}",
+            f"execution:{os.environ.get('VOIDR_EXECUTION_ID', 'unknown')}",
+            f"shard:{os.environ.get('SHARDS_CURRENT', 'unknown')}",
+            "modality:stt-redaction",
+        )
+    )
     response = httpx.post(
-        "https://api.deepgram.com/v1/listen",
-        params={
-            "model": DEEPGRAM_MODEL,
-            "language": "pt-BR",
-            "smart_format": "true",
-            "punctuate": "true",
+        f"{base}{path}",
+        data={
+            "model": config.stt_alias,
+            "language": "pt",
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": "word",
         },
         headers={
-            "Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}",
-            "Content-Type": "audio/wav",
+            "Authorization": f"Bearer {config.virtual_key}",
+            "x-litellm-tags": tags,
         },
-        content=_pcm_to_wav(pcm, sample_rate),
+        files={"file": ("segment.wav", _pcm_to_wav(pcm, sample_rate), "audio/wav")},
         timeout=30.0,
     )
     if response.status_code != 200:
-        raise RuntimeError(f"Deepgram prerecorded failed ({response.status_code})")
-    alternatives = response.json()["results"]["channels"][0]["alternatives"]
+        raise RuntimeError(f"LiteLLM transcription failed ({response.status_code})")
+    payload = response.json()
+    words = payload.get("words") if isinstance(payload, dict) else None
+    if not isinstance(words, list):
+        alternatives = payload["results"]["channels"][0]["alternatives"]
+        words = alternatives[0].get("words") or []
     return [
         Word(
             text=w.get("punctuated_word") or w["word"],
             start=float(w["start"]),
             end=float(w["end"]),
         )
-        for w in (alternatives[0].get("words") or [])
+        for w in words
     ]
+
+
+deepgram_words = litellm_words
 
 
 def plan_beeps(
     recorder: RecorderLike,
     utterances: list[tuple[int, str, str]],
     session: RedactionSession,
-    words_fn: WordsFn = deepgram_words,
+    words_fn: WordsFn = litellm_words,
 ) -> list[Beep]:
     """Compute beep intervals for every utterance whose text contains PII."""
     rate = recorder.sample_rate
@@ -203,17 +240,17 @@ def redact_call_audio(
     utterances: list[tuple[int, str, str]],
     session: RedactionSession,
     out_dir: Path,
-    words_fn: WordsFn = deepgram_words,
+    words_fn: WordsFn = litellm_words,
 ) -> dict[str, Any]:
     """Full audio-redaction step. Returns metadata for the artifacts.
 
-    Writes `call.redacted.wav`; writes the raw `call.wav` ONLY when
-    ECHO_KEEP_RAW_AUDIO=1.
+    Writes `call.redacted.wav`; writes the raw `call.wav` only in an explicitly
+    opted-in local/dev runtime.
     """
     beeps = plan_beeps(recorder, utterances, session, words_fn)
     redacted_path = out_dir / "call.redacted.wav"
     save_redacted_wav(recorder, beeps, redacted_path)
-    keep_raw = os.environ.get("ECHO_KEEP_RAW_AUDIO") == "1"
+    keep_raw = raw_audio_retention_enabled()
     if keep_raw:
         recorder.save(out_dir / "call.wav")  # type: ignore[attr-defined]
     return {
