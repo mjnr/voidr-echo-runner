@@ -76,7 +76,10 @@ class LLMBrain:
     CONTRACT_VERSION = "v3"
     PROMPT_VERSION = "echo-persona-system-v3.0.0"
     MODEL_ALIAS = "deepseek-v4-pro"
-    MODEL_REVISION = "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2"
+    MODEL_REVISION = (
+        "deepseek-v4-pro@sha256:"
+        "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+    )
 
     def __init__(
         self,
@@ -102,14 +105,9 @@ class LLMBrain:
         )
         self.org_id = os.environ["VOIDR_ORG_ID"]
         self.model_revision = os.environ["HIVE_ECHO_PERSONA_V3_MODEL_REVISION"].strip()
-        if not (
-            re.search(r"@sha256:[a-f0-9]{64}$", self.model_revision)
-            or re.fullmatch(
-                r"(?:.*@id:)?[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
-                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-                self.model_revision,
-                re.IGNORECASE,
-            )
+        if not re.fullmatch(
+            rf"{re.escape(self.MODEL_ALIAS)}@sha256:[a-f0-9]{{64}}",
+            self.model_revision,
         ):
             raise RuntimeError(
                 "HIVE_ECHO_PERSONA_V3_MODEL_REVISION must be an immutable "
