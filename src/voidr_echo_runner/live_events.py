@@ -13,6 +13,7 @@ Contract:
   dtmf_sent        {digits}
   state_transition {state, turn}
   emotional_state  {emotion, intensity, action|null}
+  call_failed      {category, code, reason}
   call_ended       {reason, status}
 
 Fire-and-forget by design: a network failure NEVER blocks or kills the call.
@@ -281,6 +282,15 @@ class LivePublisher:
         finally:
             if self._owns_sync_client:
                 self._sync_client.close()
+
+    def fail_sync(self, category: str, code: str, reason: str) -> None:
+        """Publish a sanitized operational failure before shard terminal state."""
+        self._t0_ms = self._t0_ms or int(time.time() * 1000)
+        self.emit(
+            "call_failed",
+            {"category": category, "code": code, "reason": reason},
+        )
+        self.finish_sync(code, category)
 
     # ── flush task ────────────────────────────────────────────────────────────
 

@@ -13,4 +13,4 @@ LOG_DIR="$REPO_DIR/out/serve-logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/${EXECUTION_ID:-unknown}-shard-${SHARDS_CURRENT:-1}.log"
 
-exec uv run echo-runner serve-execution --out "$REPO_DIR/out" >>"$LOG_FILE" 2>&1
+uv run echo-runner serve-execution --out "$REPO_DIR/out" 2>&1 | tee -a "$LOG_FILE"

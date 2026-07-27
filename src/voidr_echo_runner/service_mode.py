@@ -72,6 +72,20 @@ class ServeExecutionError(RuntimeError):
     pass
 
 
+def classify_operational_failure(exc: Exception) -> tuple[str, str, str]:
+    """Return stable, non-sensitive failure telemetry for UI and persistence."""
+    message = str(exc).lower()
+    if "hive persona-turn" in message and "missing:" in message:
+        return ("env_failure", "HIVE_CONFIG_MISSING", "Hive configuration is incomplete")
+    if "service_http_403" in message:
+        return ("env_failure", "SERVICE_AUTH_FORBIDDEN", "Runner access to a required API was denied")
+    if "api_key" in message or "provider" in message:
+        return ("provider_failure", "PROVIDER_AUTH_UNAVAILABLE", "Direct voice provider is unavailable")
+    if any(part in message for part in ("connect", "target", "websocket", "transport")):
+        return ("target_failure", "TARGET_UNAVAILABLE", "Voice target is unavailable")
+    return ("runner_failure", "RUNNER_EXECUTION_FAILED", "Runner failed before completing the call")
+
+
 def _environment_sensitive_values() -> tuple[str, ...]:
     try:
         params = json.loads(os.environ.get("ENVIRONMENT_PARAMS", "{}") or "{}")
@@ -130,6 +144,7 @@ CLIENT_PROMOTED_ENV_KEYS = {
 CLIENT_ENDPOINT_KEYS = {"ECHO_CALL_TARGET"}
 PLATFORM_HOST_ALLOWLIST_ENV = "ECHO_ALLOWED_TARGET_HOSTS"
 TRUSTED_ENVELOPE_ENV_KEYS = {
+    "HIVE_URL",
     "HIVE_ECHO_PERSONA_V3_MODEL_REVISION",
     "VOIDR_ORGANIZATION_ID",
     "VOIDR_EXECUTION_ID",
@@ -1125,7 +1140,21 @@ def serve_execution(out_dir: Path) -> int:
         verdict = classify_session(flow, case.assertion.flow, call)
         if live is not None:
             # terminal live event carries the evaluated session status
-            live.finish_sync(call.end_reason or "unknown", verdict.status)
+            if verdict.status == "env_failure":
+                if call.transport_error:
+                    live.fail_sync(
+                        "target_failure",
+                        "TARGET_UNAVAILABLE",
+                        "Voice target transport failed",
+                    )
+                else:
+                    live.fail_sync(
+                        "env_failure",
+                        "CALL_ENV_FAILURE",
+                        "Call ended before agent evaluation completed",
+                    )
+            else:
+                live.finish_sync(call.end_reason or "unknown", verdict.status)
 
         # Everything persisted or POSTed from here on is redacted
         # (artifacts, session transcript/timeline, deviation details).
@@ -1272,6 +1301,11 @@ def serve_execution(out_dir: Path) -> int:
                 "finishedAt": _iso_now(),
                 "durationMs": call.duration_ms,
                 **(
+                    {"errorMessage": "env_failure:CALL_ENV_FAILURE"}
+                    if verdict.status == "env_failure"
+                    else {}
+                ),
+                **(
                     {"cloudJobId": os.environ["CLOUD_JOB_ID"]}
                     if os.environ.get("CLOUD_JOB_ID")
                     else {}
@@ -1294,8 +1328,27 @@ def serve_execution(out_dir: Path) -> int:
             _safe_log("evaluation_failed")
         _safe_log(f"shard {shard_index}/{shard_total} FINISHED reported")
         return 0
-    except Exception:  # noqa: BLE001 — report infra failure to the service
-        _safe_log("echo-runner serve-execution: FAILED runner_execution_failed", stderr=True)
+    except Exception as exc:  # noqa: BLE001 — report infra failure to the service
+        failure_category, failure_code, failure_reason = classify_operational_failure(exc)
+        _safe_log(
+            "echo-runner serve-execution: FAILED runner_execution_failed "
+            f"category={failure_category} code={failure_code}",
+            stderr=True,
+        )
+        try:
+            from .live_events import LivePublisher
+
+            failure_live = live if "live" in locals() and live is not None else LivePublisher(
+                api_url,
+                execution_id,
+                shard_index,
+                token=token,
+                redact=redaction.redact if "redaction" in locals() else None,
+                audio_enabled=False,
+            )
+            failure_live.fail_sync(failure_category, failure_code, failure_reason)
+        except Exception:  # noqa: BLE001
+            _safe_log("failed_to_publish_live_failure", stderr=True)
         try:
             api.put_shard(
                 execution_id,
@@ -1309,7 +1362,7 @@ def serve_execution(out_dir: Path) -> int:
                         if os.environ.get("CLOUD_JOB_ID")
                         else {}
                     ),
-                    "errorMessage": "runner_execution_failed",
+                    "errorMessage": f"{failure_category}:{failure_code}",
                 },
             )
         except Exception:  # noqa: BLE001
