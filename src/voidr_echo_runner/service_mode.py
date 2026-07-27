@@ -77,6 +77,12 @@ def classify_operational_failure(exc: Exception) -> tuple[str, str, str]:
     message = str(exc).lower()
     if "hive persona-turn" in message and "missing:" in message:
         return ("env_failure", "HIVE_CONFIG_MISSING", "Hive configuration is incomplete")
+    if "upstream_invalid_response" in message or "persona-turn v3 failed (502" in message:
+        return (
+            "hive_failure",
+            "HIVE_UPSTREAM_INVALID_RESPONSE",
+            "Hive model provider returned an invalid response",
+        )
     if "service_http_403" in message:
         return ("env_failure", "SERVICE_AUTH_FORBIDDEN", "Runner access to a required API was denied")
     if "api_key" in message or "provider" in message:
@@ -1138,21 +1144,28 @@ def serve_execution(out_dir: Path) -> int:
             transport_error=call.transport_error,
         )
         verdict = classify_session(flow, case.assertion.flow, call)
-        if live is not None:
-            # terminal live event carries the evaluated session status
-            if verdict.status == "env_failure":
-                if call.transport_error:
-                    live.fail_sync(
+        call_failure: tuple[str, str, str] | None = None
+        if verdict.status == "env_failure":
+            if call.transport_error:
+                call_failure = classify_operational_failure(
+                    ServeExecutionError(call.transport_error)
+                )
+                if call_failure[1] == "RUNNER_EXECUTION_FAILED":
+                    call_failure = (
                         "target_failure",
                         "TARGET_UNAVAILABLE",
                         "Voice target transport failed",
                     )
-                else:
-                    live.fail_sync(
-                        "env_failure",
-                        "CALL_ENV_FAILURE",
-                        "Call ended before agent evaluation completed",
-                    )
+            else:
+                call_failure = (
+                    "env_failure",
+                    "CALL_ENV_FAILURE",
+                    "Call ended before agent evaluation completed",
+                )
+        if live is not None:
+            # terminal live event carries the evaluated session status
+            if call_failure is not None:
+                live.fail_sync(*call_failure)
             else:
                 live.finish_sync(call.end_reason or "unknown", verdict.status)
 
@@ -1301,8 +1314,8 @@ def serve_execution(out_dir: Path) -> int:
                 "finishedAt": _iso_now(),
                 "durationMs": call.duration_ms,
                 **(
-                    {"errorMessage": "env_failure:CALL_ENV_FAILURE"}
-                    if verdict.status == "env_failure"
+                    {"errorMessage": f"{call_failure[0]}:{call_failure[1]}"}
+                    if call_failure is not None
                     else {}
                 ),
                 **(
