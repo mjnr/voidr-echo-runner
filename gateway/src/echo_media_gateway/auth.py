@@ -21,8 +21,8 @@ from .state import (
 )
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}$")
-_PROVIDERS = frozenset({"litellm"})
-_TTS_PROVIDERS = frozenset({"litellm"})
+_PROVIDERS = frozenset({"deepgram", "elevenlabs"})
+_TTS_PROVIDERS = frozenset({"elevenlabs"})
 
 
 class CapabilityError(ValueError):

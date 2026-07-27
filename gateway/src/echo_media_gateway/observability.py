@@ -9,7 +9,7 @@ from threading import Lock
 from typing import Callable
 
 _ALLOWED_TAGS = {"org", "execution", "shard", "provider", "model", "modality"}
-_METRIC_PROVIDERS = {"litellm"}
+_METRIC_PROVIDERS = {"deepgram", "elevenlabs"}
 _METRIC_STATUSES = {"ok", "rejected", "error"}
 
 

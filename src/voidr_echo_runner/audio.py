@@ -62,16 +62,10 @@ class AudioServices:
 
 def resolve_audio_services() -> AudioServices:
     """Validate env-var gated providers, failing with actionable guidance."""
-    config = resolve_voice_config()
-    if not config.direct:
-        return AudioServices(
-            stt_provider=f"litellm/{config.stt_alias}",
-            tts_provider=f"litellm/{config.tts_alias}",
-        )
+    resolve_voice_config()
     if not os.environ.get("DEEPGRAM_API_KEY"):
         raise RuntimeError(
-            "Direct local audio mode requires DEEPGRAM_API_KEY. Prefer "
-            "VOICE_GATEWAY_URL + VOICE_GATEWAY_TOKEN."
+            "Audio mode requires DEEPGRAM_API_KEY from the runtime secret projection."
         )
     if os.environ.get("ELEVENLABS_API_KEY"):
         return AudioServices(stt_provider="deepgram", tts_provider="elevenlabs")
@@ -113,13 +107,9 @@ class PipecatAudioEngine:
         self.voice_id = voice_id
         self.sample_rate = sample_rate
         config = resolve_voice_config()
-        self._gateway: VoiceGatewayAudioEngine | None = None
-        if not config.direct:
-            self._gateway = VoiceGatewayAudioEngine(config, voice_id, sample_rate)
-            self._deepgram_key = ""
-            self._elevenlabs_key = ""
-            self._aiohttp_session = None
-            return
+        self._gateway: VoiceGatewayAudioEngine | None = VoiceGatewayAudioEngine(
+            config, voice_id, sample_rate
+        )
         self._deepgram_key = os.environ["DEEPGRAM_API_KEY"]
         self._elevenlabs_key = os.environ["ELEVENLABS_API_KEY"]
         self._aiohttp_session: aiohttp.ClientSession | None = None
@@ -139,8 +129,9 @@ class PipecatAudioEngine:
 
     async def synthesize(self, text: str) -> bytes:
         """Text -> PCM s16le mono @16kHz through an ElevenLabs Pipecat pipeline."""
-        if self._gateway is not None:
-            return await self._gateway.synthesize(text)
+        return await self._gateway.synthesize(text)
+        # Retained as a local implementation reference; managed execution uses
+        # the streaming direct-provider client above.
         tts = ElevenLabsHttpTTSService(
             api_key=self._elevenlabs_key,
             aiohttp_session=await self._session(),
@@ -162,18 +153,14 @@ class PipecatAudioEngine:
         return bytes(collector.audio)
 
     async def synthesize_chunks(self, text: str):
-        if self._gateway is not None:
-            async for chunk in self._gateway.synthesize_chunks(text):
-                yield chunk
-            return
-        # Direct providers are local/test-only and may not expose progressive
-        # chunks through Pipecat; keep the same adapter contract.
-        yield await self.synthesize(text)
+        async for chunk in self._gateway.synthesize_chunks(text):
+            yield chunk
 
     async def transcribe(self, pcm: bytes) -> str:
         """PCM s16le mono @16kHz -> text through a Deepgram Pipecat pipeline."""
-        if self._gateway is not None:
-            return await self._gateway.transcribe(pcm)
+        return await self._gateway.transcribe(pcm)
+        # Retained as a local implementation reference; managed execution uses
+        # the segmented direct-provider client above.
         stt = DeepgramSTTService(
             api_key=self._deepgram_key,
             sample_rate=self.sample_rate,
@@ -209,14 +196,9 @@ class PipecatAudioEngine:
         return " ".join(collector.transcripts).strip()
 
     async def transcribe_stream(self, chunks, *, on_interim=None) -> str:
-        if self._gateway is not None:
-            return await self._gateway.transcribe_stream(
-                chunks, on_interim=on_interim
-            )
-        # Direct providers are local/test-only. Production always streams
-        # through the governed LiteLLM proxy and never receives Deepgram keys.
-        pcm = b"".join([chunk async for chunk in chunks])
-        return await self.transcribe(pcm)
+        return await self._gateway.transcribe_stream(
+            chunks, on_interim=on_interim
+        )
 
     async def _run_pipeline(
         self,

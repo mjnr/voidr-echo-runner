@@ -8,8 +8,8 @@ intervals and overwrites them with a 1 kHz beep, producing
 
 Word alignment: the call recording is turn-based (each utterance is a known
 segment of the stereo WAV), so only segments whose text contains PII are
-re-transcribed via LiteLLM /audio/transcriptions (word-level timestamps come
-in the response). This runs POST-call: zero latency added to the live
+re-transcribed directly through Deepgram (word-level timestamps come in the
+response). This runs POST-call: zero latency added to the live
 conversation, one REST call per PII-bearing segment.
 
 Fail-closed by design: if word timestamps cannot be fetched or the PII cannot
@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from .redaction import RedactionSession
-from .voice_gateway import resolve_voice_config
+from .voice_gateway import DEEPGRAM_BASE_URL, resolve_voice_config
 
 _LOCAL_RAW_AUDIO_ENVIRONMENTS = {"local", "dev", "development"}
 
@@ -76,45 +76,32 @@ class RecorderLike(Protocol):
 WordsFn = Callable[[bytes, int], list[Word]]
 
 
-def litellm_words(pcm: bytes, sample_rate: int) -> list[Word]:
-    """Word-level timestamps through governed LiteLLM transcription."""
+def deepgram_words(pcm: bytes, sample_rate: int) -> list[Word]:
+    """Word-level timestamps through direct Deepgram transcription."""
     import httpx
 
     config = resolve_voice_config()
-    if config.direct or not config.litellm_url or not config.virtual_key or not config.stt_alias:
-        raise RuntimeError("word alignment requires governed LiteLLM configuration")
-    base = config.litellm_url.rstrip("/")
-    path = "/audio/transcriptions" if base.endswith("/v1") else "/v1/audio/transcriptions"
-    tags = ",".join(
-        (
-            f"org:{os.environ.get('VOIDR_ORGANIZATION_ID', 'unknown')}",
-            f"execution:{os.environ.get('VOIDR_EXECUTION_ID', 'unknown')}",
-            f"shard:{os.environ.get('SHARDS_CURRENT', 'unknown')}",
-            "modality:stt-redaction",
-        )
-    )
     response = httpx.post(
-        f"{base}{path}",
-        data={
-            "model": config.stt_alias,
-            "language": "pt",
-            "response_format": "verbose_json",
-            "timestamp_granularities[]": "word",
+        f"{DEEPGRAM_BASE_URL}/listen",
+        params={
+            "model": "nova-2",
+            "language": "pt-BR",
+            "smart_format": "true",
+            "punctuate": "true",
+            "utterances": "true",
         },
         headers={
-            "Authorization": f"Bearer {config.virtual_key}",
-            "x-litellm-tags": tags,
+            "Authorization": f"Token {config.deepgram_key}",
+            "Content-Type": "audio/wav",
         },
-        files={"file": ("segment.wav", _pcm_to_wav(pcm, sample_rate), "audio/wav")},
+        content=_pcm_to_wav(pcm, sample_rate),
         timeout=30.0,
     )
     if response.status_code != 200:
-        raise RuntimeError(f"LiteLLM transcription failed ({response.status_code})")
+        raise RuntimeError(f"Deepgram transcription failed ({response.status_code})")
     payload = response.json()
-    words = payload.get("words") if isinstance(payload, dict) else None
-    if not isinstance(words, list):
-        alternatives = payload["results"]["channels"][0]["alternatives"]
-        words = alternatives[0].get("words") or []
+    alternatives = payload["results"]["channels"][0]["alternatives"]
+    words = alternatives[0].get("words") or []
     return [
         Word(
             text=w.get("punctuated_word") or w["word"],
@@ -124,15 +111,11 @@ def litellm_words(pcm: bytes, sample_rate: int) -> list[Word]:
         for w in words
     ]
 
-
-deepgram_words = litellm_words
-
-
 def plan_beeps(
     recorder: RecorderLike,
     utterances: list[tuple[int, str, str]],
     session: RedactionSession,
-    words_fn: WordsFn = litellm_words,
+    words_fn: WordsFn = deepgram_words,
 ) -> list[Beep]:
     """Compute beep intervals for every utterance whose text contains PII."""
     rate = recorder.sample_rate
@@ -240,7 +223,7 @@ def redact_call_audio(
     utterances: list[tuple[int, str, str]],
     session: RedactionSession,
     out_dir: Path,
-    words_fn: WordsFn = litellm_words,
+    words_fn: WordsFn = deepgram_words,
 ) -> dict[str, Any]:
     """Full audio-redaction step. Returns metadata for the artifacts.
 

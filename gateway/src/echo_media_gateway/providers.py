@@ -62,64 +62,25 @@ class VoiceProviders:
     def __init__(
         self,
         *,
-        litellm_url: str | None = None,
-        litellm_key: str | None = None,
-        tts_alias: str | None = None,
-        stt_alias: str | None = None,
+        elevenlabs_key: str | None = None,
+        deepgram_key: str | None = None,
         http_client: httpx.AsyncClient | None = None,
         require_tls: bool = False,
     ):
-        self.litellm_url = (litellm_url or os.environ.get("LITELLM_BASE_URL", "")).rstrip("/")
-        self.litellm_key = litellm_key or os.environ.get("LITELLM_API_KEY")
-        self.tts_alias = tts_alias or os.environ.get("LITELLM_TTS_MODEL")
-        self.stt_alias = stt_alias or os.environ.get("LITELLM_STT_MODEL")
+        self.elevenlabs_key = elevenlabs_key or os.environ.get("ELEVENLABS_API_KEY")
+        self.deepgram_key = deepgram_key or os.environ.get("DEEPGRAM_API_KEY")
         self._http = http_client
         self.require_tls = require_tls
-        if self.litellm_url:
-            parsed = urlsplit(self.litellm_url)
-            if (
-                not parsed.hostname
-                or parsed.username
-                or parsed.password
-                or (self.require_tls and parsed.scheme != "https")
-                or (not self.require_tls and parsed.scheme not in {"http", "https"})
-            ):
-                raise ProviderConfigurationError("litellm_tls_required")
-            rules = os.environ.get(
-                "AI_EGRESS_HOST_ALLOWLIST",
-                "llm.voidr.co,localhost,127.0.0.1,*.test",
-            ).lower().split(",")
-            host = parsed.hostname.lower()
-            if not any(
-                host == rule.strip()
-                or (
-                    rule.strip().startswith("*.")
-                    and host.endswith(rule.strip()[1:])
-                    and len(host) > len(rule.strip()[1:])
-                )
-                for rule in rules
-            ):
-                raise ProviderConfigurationError("litellm_host_not_allowed")
 
     def readiness(self, enabled: set[str]) -> tuple[bool, str | None]:
         """Validate only declared routes; credentials are never returned/logged."""
-        if enabled != {"litellm"}:
+        if enabled != {"deepgram", "elevenlabs"}:
             return False, "unknown_provider_route"
-        if not all(
-            (self.litellm_url, self.litellm_key, self.tts_alias, self.stt_alias)
-        ):
+        if not self.deepgram_key or not self.elevenlabs_key:
             return False, "provider_not_configured"
         return True, None
 
-    def _headers(self, tags: dict[str, str] | None = None) -> dict[str, str]:
-        headers = {"Authorization": f"Bearer {self.litellm_key}"}
-        if tags:
-            headers["x-litellm-tags"] = ",".join(
-                f"{key}:{value}" for key, value in sorted(tags.items())
-            )
-        return headers
-
-    async def litellm(
+    async def elevenlabs(
         self,
         *,
         text: str,
@@ -128,32 +89,32 @@ class VoiceProviders:
         output_format: str,
         tags: dict[str, str] | None = None,
     ) -> AsyncIterator[bytes]:
-        if not self.litellm_url:
-            raise ProviderConfigurationError("litellm_not_configured")
+        if not self.elevenlabs_key:
+            raise ProviderConfigurationError("elevenlabs_not_configured")
         if output_format != "pcm_16000":
-            raise ProviderConfigurationError("litellm_requires_pcm_16000")
+            raise ProviderConfigurationError("elevenlabs_requires_pcm_16000")
         body = {
-            "model": model,
-            "input": text,
-            "voice": voice,
-            "output_format": "pcm_16000",
+            "model_id": model,
+            "text": text,
+            "language_code": "pt",
         }
-        speech_path = (
-            "/audio/speech"
-            if self.litellm_url.endswith("/v1")
-            else "/v1/audio/speech"
-        )
         owned = self._http is None
         client = self._http or httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10))
         try:
             async with client.stream(
                 "POST",
-                f"{self.litellm_url}{speech_path}",
-                headers=self._headers(tags),
+                (
+                    "https://api.elevenlabs.io/v1/text-to-speech/"
+                    f"{voice}?output_format=pcm_16000"
+                ),
+                headers={
+                    "xi-api-key": self.elevenlabs_key,
+                    "Content-Type": "application/json",
+                },
                 json=body,
             ) as response:
                 response.raise_for_status()
-                source_rate = _pcm_sample_rate(response.headers)
+                source_rate = 16_000
                 buffered = bytearray()
                 async for chunk in response.aiter_bytes():
                     if source_rate == 16_000:
@@ -180,33 +141,41 @@ class VoiceProviders:
         language: str,
         tags: dict[str, str] | None = None,
     ) -> str:
-        if not self.litellm_url or not self.litellm_key:
-            raise ProviderConfigurationError("litellm_not_configured")
+        if not self.deepgram_key:
+            raise ProviderConfigurationError("deepgram_not_configured")
         output = io.BytesIO()
         with wave.open(output, "wb") as wav:
             wav.setnchannels(1)
             wav.setsampwidth(2)
             wav.setframerate(sample_rate)
             wav.writeframes(pcm)
-        path = (
-            "/audio/transcriptions"
-            if self.litellm_url.endswith("/v1")
-            else "/v1/audio/transcriptions"
-        )
         owned = self._http is None
         client = self._http or httpx.AsyncClient(timeout=httpx.Timeout(60, connect=10))
         try:
             response = await client.post(
-                f"{self.litellm_url}{path}",
-                headers=self._headers(tags),
-                data={"model": model, "language": language, "response_format": "json"},
-                files={"file": ("utterance.wav", output.getvalue(), "audio/wav")},
+                "https://api.deepgram.com/v1/listen",
+                headers={
+                    "Authorization": f"Token {self.deepgram_key}",
+                    "Content-Type": "audio/wav",
+                },
+                params={
+                    "model": model,
+                    "language": language,
+                    "smart_format": "true",
+                    "punctuate": "true",
+                },
+                content=output.getvalue(),
             )
             response.raise_for_status()
             payload = response.json()
-            text = payload.get("text") if isinstance(payload, dict) else None
+            alternatives = (
+                payload.get("results", {}).get("channels", [{}])[0].get("alternatives", [])
+                if isinstance(payload, dict)
+                else []
+            )
+            text = alternatives[0].get("transcript") if alternatives else None
             if not isinstance(text, str):
-                raise ProviderConfigurationError("litellm_transcription_missing_text")
+                raise ProviderConfigurationError("deepgram_transcription_missing_text")
             return text.strip()
         finally:
             if owned:

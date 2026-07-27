@@ -7,13 +7,11 @@ from pathlib import Path
 from typing import MutableMapping
 
 GATEWAY_SECRET_NAMES = (
+    "DEEPGRAM_API_KEY",
+    "ELEVENLABS_API_KEY",
     "ECHO_MEDIA_GATEWAY_AUTH_TOKEN",
     "VOICE_GATEWAY_SIGNING_SECRET",
     "VOICE_GATEWAY_METRICS_TOKEN",
-    "LITELLM_BASE_URL",
-    "LITELLM_API_KEY",
-    "LITELLM_TTS_MODEL",
-    "LITELLM_STT_MODEL",
     "REDIS_URL",
 )
 DEFAULT_SECRET_DIR = Path("/var/run/secrets/voidr")

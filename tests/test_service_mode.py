@@ -312,43 +312,46 @@ def test_customer_params_cannot_overwrite_platform_fallbacks():
     assert env["DEEPGRAM_API_KEY"] == "local"
 
 
-def test_trusted_envelope_promotes_key_and_observability_scope():
+def test_trusted_envelope_promotes_model_revision_and_observability_scope():
     env = {}
     promoted = promote_trusted_envelope_to_environ(
         {
-            "LITELLM_API_KEY": "platform-virtual-key",
+            "HIVE_ECHO_PERSONA_V3_MODEL_REVISION": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
             "VOIDR_ORGANIZATION_ID": "org-trusted",
             "VOIDR_EXECUTION_ID": "execution-trusted",
         },
         environ=env,
     )
     assert promoted == [
-        "LITELLM_API_KEY",
+        "HIVE_ECHO_PERSONA_V3_MODEL_REVISION",
         "VOIDR_EXECUTION_ID",
         "VOIDR_ORGANIZATION_ID",
     ]
     assert env == {
-        "LITELLM_API_KEY": "platform-virtual-key",
+        "HIVE_ECHO_PERSONA_V3_MODEL_REVISION": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
         "VOIDR_ORGANIZATION_ID": "org-trusted",
         "VOIDR_EXECUTION_ID": "execution-trusted",
     }
 
 
-def test_client_params_cannot_inject_governed_key_or_scope():
+def test_client_params_cannot_inject_direct_provider_keys_or_scope():
     env = {
-        "LITELLM_API_KEY": "platform-virtual-key",
+        "DEEPGRAM_API_KEY": "projected-deepgram",
+        "ELEVENLABS_API_KEY": "projected-elevenlabs",
         "VOIDR_ORGANIZATION_ID": "org-trusted",
         "VOIDR_EXECUTION_ID": "execution-trusted",
     }
     promote_params_to_environ(
         {
-            "LITELLM_API_KEY": "attacker-key",
+            "DEEPGRAM_API_KEY": "attacker-key",
+            "ELEVENLABS_API_KEY": "attacker-key",
             "VOIDR_ORGANIZATION_ID": "org-attacker",
             "VOIDR_EXECUTION_ID": "execution-attacker",
         },
         environ=env,
     )
-    assert env["LITELLM_API_KEY"] == "platform-virtual-key"
+    assert env["DEEPGRAM_API_KEY"] == "projected-deepgram"
+    assert env["ELEVENLABS_API_KEY"] == "projected-elevenlabs"
     assert env["VOIDR_ORGANIZATION_ID"] == "org-trusted"
     assert env["VOIDR_EXECUTION_ID"] == "execution-trusted"
 
@@ -357,12 +360,11 @@ def test_consumed_envelope_rejects_client_key_tenant_and_execution_injection():
     api = object.__new__(VoidrApi)
     api._request = lambda *_args, **_kwargs: {
         "trustedEnv": {
-            "LITELLM_API_KEY": "platform-key",
             "VOIDR_ORGANIZATION_ID": "org-trusted",
             "VOIDR_EXECUTION_ID": "execution-trusted",
         },
         "clientParams": {
-            "LITELLM_API_KEY": "attacker-key",
+            "DEEPGRAM_API_KEY": "attacker-key",
             "VOIDR_ORGANIZATION_ID": "org-attacker",
             "VOIDR_EXECUTION_ID": "execution-attacker",
         },

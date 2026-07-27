@@ -130,11 +130,6 @@ CLIENT_PROMOTED_ENV_KEYS = {
 CLIENT_ENDPOINT_KEYS = {"ECHO_CALL_TARGET"}
 PLATFORM_HOST_ALLOWLIST_ENV = "ECHO_ALLOWED_TARGET_HOSTS"
 TRUSTED_ENVELOPE_ENV_KEYS = {
-    "LITELLM_API_KEY",
-    "LITELLM_BASE_URL",
-    "LITELLM_TTS_MODEL",
-    "LITELLM_STT_MODEL",
-    "LITELLM_STREAMING_STT_URL",
     "HIVE_ECHO_PERSONA_V3_MODEL_REVISION",
     "VOIDR_ORGANIZATION_ID",
     "VOIDR_EXECUTION_ID",
@@ -1157,10 +1152,10 @@ def serve_execution(out_dir: Path) -> int:
         wav_path: Path | None = None
         if mode == "audio" and recorder is not None:
             meta["audio"] = {
-                "sttProvider": "litellm",
-                "ttsProvider": "litellm",
-                "sttModel": os.environ.get("LITELLM_STT_MODEL", ""),
-                "ttsModel": os.environ.get("LITELLM_TTS_MODEL", ""),
+                "sttProvider": "deepgram",
+                "ttsProvider": "elevenlabs",
+                "sttModel": "nova-2",
+                "ttsModel": "eleven_flash_v2_5",
                 "voiceId": persona.speech.voiceId,
                 "sttTurns": transport.stt_turns,
                 "ttsTurns": transport.tts_turns,

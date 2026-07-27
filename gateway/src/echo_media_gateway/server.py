@@ -222,13 +222,12 @@ class MediaGateway:
         model = self._param(
             query,
             "model",
-            self.providers.stt_alias
-            or "echo-stt-deepgram-nova-2@id:2026-07-26",
+            "nova-2",
         )
         started = time.monotonic()
         tags = {"provider": provider, "model": model}
         try:
-            if provider != "litellm":
+            if provider != "deepgram":
                 raise CapabilityError("unknown_provider")
             claims = await self._voice_claims(ws, provider, model)
             tags = claims.tags(provider, model)
@@ -358,8 +357,7 @@ class MediaGateway:
         self, ws: ServerConnection, provider: str, query: dict[str, list[str]]
     ) -> None:
         defaults = {
-            "litellm": self.providers.tts_alias
-            or "echo-tts-elevenlabs-flash-v2-5@id:2026-07-26",
+            "elevenlabs": "eleven_flash_v2_5",
         }
         model = self._param(query, "model", defaults.get(provider, "unknown"))
         started = time.monotonic()
@@ -779,12 +777,6 @@ def main() -> None:
     local = runtime in {"local", "dev", "development", "test"}
     if runtime not in {"local", "dev", "development", "test", "cloud", "staging", "prod", "production"}:
         raise SystemExit("ECHO_RUNTIME_ENV must explicitly identify local/dev or production")
-    if not local and any(
-        os.environ.get(name) for name in ("DEEPGRAM_API_KEY", "ELEVENLABS_API_KEY")
-    ):
-        raise SystemExit(
-            "direct provider credentials are forbidden in the production voice gateway"
-        )
     if not signing_secret and not local:
         raise SystemExit(
             "VOICE_GATEWAY_SIGNING_SECRET is required outside local/dev/test"
@@ -830,7 +822,7 @@ def main() -> None:
         enabled_providers = {
             item.strip().lower()
             for item in os.environ.get(
-                "VOICE_GATEWAY_ENABLED_PROVIDERS", ""
+                "VOICE_GATEWAY_ENABLED_PROVIDERS", "deepgram,elevenlabs"
             ).split(",")
             if item.strip()
         }

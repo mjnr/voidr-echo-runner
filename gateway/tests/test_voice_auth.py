@@ -16,7 +16,7 @@ from echo_media_gateway.auth import (
 from echo_media_gateway.state import MemoryVoiceStateBackend, StateBackendUnavailable
 
 SECRET = "unit-test-signing-secret-at-least-32-bytes"
-MODEL = "echo-stt-deepgram-nova-2@id:2026-07-26"
+MODEL = "nova-2"
 
 
 def capability(**overrides) -> str:
@@ -24,9 +24,9 @@ def capability(**overrides) -> str:
         "org": "org-test",
         "execution": "exec-123",
         "shard": "shard-0",
-        "providers": ["litellm"],
-        "models": {"litellm": [MODEL]},
-        "voices": {"litellm": ["voice-allowed"]},
+        "providers": ["deepgram"],
+        "models": {"deepgram": [MODEL]},
+        "voices": {},
         "iat": 1_000,
         "exp": 1_300,
         "jti": "token-123",
@@ -46,12 +46,12 @@ def capability(**overrides) -> str:
 
 async def test_scoped_capability_and_replay_protection():
     verifier = CapabilityVerifier(SECRET, clock=lambda: 1_100)
-    claims = await verifier.verify(capability(), "request-1", "litellm", MODEL)
+    claims = await verifier.verify(capability(), "request-1", "deepgram", MODEL)
     assert claims.org == "org-test"
     with pytest.raises(CapabilityError, match="replay"):
-        await verifier.verify(capability(), "request-1", "litellm", MODEL)
+        await verifier.verify(capability(), "request-1", "deepgram", MODEL)
     with pytest.raises(CapabilityError, match="scope_denied"):
-        await verifier.verify(capability(), "request-2", "litellm", "unknown")
+        await verifier.verify(capability(), "request-2", "deepgram", "unknown")
 
 
 @pytest.mark.parametrize(
@@ -61,37 +61,36 @@ async def test_scoped_capability_and_replay_protection():
         ({"exp": 2_000}, "invalid_expiry"),
         ({"providers": ["unknown"]}, "invalid_claims"),
         ({"org": "contains spaces"}, "invalid_claims"),
-        ({"providers": ["litellm"], "models": {}}, "invalid_claims"),
-        ({"models": {"litellm": []}}, "invalid_claims"),
-        ({"voices": {}}, "invalid_claims"),
-        ({"voices": {"litellm": []}}, "invalid_claims"),
+        ({"providers": ["deepgram"], "models": {}}, "invalid_claims"),
+        ({"models": {"deepgram": []}}, "invalid_claims"),
+        ({"voices": {"deepgram": ["not-allowed"]}}, "invalid_claims"),
     ],
 )
 async def test_capability_fails_closed(overrides, code):
     verifier = CapabilityVerifier(SECRET, clock=lambda: 1_100)
     with pytest.raises(CapabilityError, match=code):
-        await verifier.verify(capability(**overrides), "request-1", "litellm", MODEL)
+        await verifier.verify(capability(**overrides), "request-1", "deepgram", MODEL)
 
 
 async def test_token_request_limit_is_enforced():
     verifier = CapabilityVerifier(SECRET, clock=lambda: 1_100)
     token = capability(max_requests=1)
-    await verifier.verify(token, "request-1", "litellm", MODEL)
+    await verifier.verify(token, "request-1", "deepgram", MODEL)
     with pytest.raises(CapabilityError, match="token_use_limit"):
-        await verifier.verify(token, "request-2", "litellm", MODEL)
+        await verifier.verify(token, "request-2", "deepgram", MODEL)
 
 
 async def test_cps_and_concurrency_limits():
     now = 10.0
     limiter = VoiceRateLimiter(cps=2, concurrent=1, clock=lambda: now)
-    async with limiter.acquire("org", "litellm"):
+    async with limiter.acquire("org", "deepgram"):
         with pytest.raises(RateLimitExceeded, match="concurrency_exceeded"):
-            async with limiter.acquire("org", "litellm"):
+            async with limiter.acquire("org", "deepgram"):
                 pass
-    async with limiter.acquire("org", "litellm"):
+    async with limiter.acquire("org", "deepgram"):
         pass
     with pytest.raises(RateLimitExceeded, match="cps_exceeded"):
-        async with limiter.acquire("org", "litellm"):
+        async with limiter.acquire("org", "deepgram"):
             pass
     await asyncio.sleep(0)
 
@@ -105,26 +104,26 @@ async def test_replay_and_request_limit_are_shared_across_replicas():
         SECRET, clock=lambda: 1_100, replay_guard=ReplayGuard(backend=backend)
     )
     token = capability(max_requests=2)
-    await first.verify(token, "replica-a", "litellm", MODEL)
+    await first.verify(token, "replica-a", "deepgram", MODEL)
     with pytest.raises(CapabilityError, match="replay"):
-        await second.verify(token, "replica-a", "litellm", MODEL)
-    await second.verify(token, "replica-b", "litellm", MODEL)
+        await second.verify(token, "replica-a", "deepgram", MODEL)
+    await second.verify(token, "replica-b", "deepgram", MODEL)
     with pytest.raises(CapabilityError, match="token_use_limit"):
-        await first.verify(token, "replica-c", "litellm", MODEL)
+        await first.verify(token, "replica-c", "deepgram", MODEL)
 
 
 async def test_limits_are_shared_across_replicas():
     backend = MemoryVoiceStateBackend(clock=lambda: 10)
     first = VoiceRateLimiter(cps=2, concurrent=1, backend=backend)
     second = VoiceRateLimiter(cps=2, concurrent=1, backend=backend)
-    async with first.acquire("org", "litellm"):
+    async with first.acquire("org", "deepgram"):
         with pytest.raises(RateLimitExceeded, match="concurrency_exceeded"):
-            async with second.acquire("org", "litellm"):
+            async with second.acquire("org", "deepgram"):
                 pass
-    async with second.acquire("org", "litellm"):
+    async with second.acquire("org", "deepgram"):
         pass
     with pytest.raises(RateLimitExceeded, match="cps_exceeded"):
-        async with first.acquire("org", "litellm"):
+        async with first.acquire("org", "deepgram"):
             pass
 
 
@@ -142,8 +141,8 @@ async def test_redis_failure_fails_closed():
         SECRET, clock=lambda: 1_100, replay_guard=ReplayGuard(backend=backend)
     )
     with pytest.raises(CapabilityError, match="state_unavailable"):
-        await verifier.verify(capability(), "request-1", "litellm", MODEL)
+        await verifier.verify(capability(), "request-1", "deepgram", MODEL)
     limiter = VoiceRateLimiter(backend=backend)
     with pytest.raises(RateLimitExceeded, match="state_unavailable"):
-        async with limiter.acquire("org", "litellm"):
+        async with limiter.acquire("org", "deepgram"):
             pass
