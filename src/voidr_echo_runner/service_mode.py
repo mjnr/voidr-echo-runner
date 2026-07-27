@@ -717,25 +717,81 @@ def classify_session(
 def resolve_persona_plan_entry(
     params: dict[str, str], shard_index: int
 ) -> dict[str, Any] | None:
-    """Per-shard persona assignment from ENVIRONMENT_PARAMS.ECHO_PERSONA_PLAN.
+    """Per-shard persona assignment declared by the execution.
 
-    The service serializes one JSON array aligned with the execution targets
-    (shard N reads entry N-1): `[{"personaId": "...", "overrides": {...}}]`.
-    Absent/short/broken plans mean "use the case's own persona" — a malformed
-    plan must never fail the call, only fall back loudly.
+    Canonical contract: ECHO_PERSONA_SELECTION — a single JSON object
+    (`{"personaId": "...", "overrides": {...}}`) already scoped to THIS shard
+    by the service envelope; no shard-index arithmetic can misresolve it.
+
+    Transition compat: ECHO_PERSONA_PLAN (JSON array).
+      * one entry  → the shard's own selection (per-shard envelope singleton),
+        returned regardless of shard_index;
+      * many entries → legacy full plan aligned 1:1 with shards
+        (shard N reads entry N-1).
+
+    Fail-closed: when the execution DECLARED a persona (selection or plan
+    present) but it cannot be resolved, raise ServeExecutionError — running
+    the call with the case's fallback persona would use the WRONG VOICE
+    silently. The `None` fallback is only for executions that declared
+    nothing.
     """
+    raw_selection = params.get("ECHO_PERSONA_SELECTION")
+    if raw_selection:
+        try:
+            selection = json.loads(raw_selection)
+        except json.JSONDecodeError as exc:
+            raise ServeExecutionError(
+                f"ECHO_PERSONA_SELECTION is invalid JSON (shardIndex={shard_index})"
+            ) from exc
+        if not isinstance(selection, dict) or not selection.get("personaId"):
+            raise ServeExecutionError(
+                "ECHO_PERSONA_SELECTION must be an object with personaId "
+                f"(shardIndex={shard_index})"
+            )
+        return selection
+
     raw = params.get("ECHO_PERSONA_PLAN")
     if not raw:
         return None
     try:
         plan = json.loads(raw)
-    except json.JSONDecodeError:
-        _safe_log("ECHO_PERSONA_PLAN inválido; ignorado", stderr=True)
+    except json.JSONDecodeError as exc:
+        raise ServeExecutionError(
+            f"ECHO_PERSONA_PLAN is invalid JSON (shardIndex={shard_index})"
+        ) from exc
+    if not isinstance(plan, list):
+        raise ServeExecutionError(
+            f"ECHO_PERSONA_PLAN must be a JSON array (shardIndex={shard_index})"
+        )
+    if len(plan) == 0:
         return None
-    if not isinstance(plan, list) or shard_index < 1 or shard_index > len(plan):
-        return None
-    entry = plan[shard_index - 1]
-    return entry if isinstance(entry, dict) else None
+    if len(plan) == 1:
+        entry = plan[0]
+    elif 1 <= shard_index <= len(plan):
+        entry = plan[shard_index - 1]
+    else:
+        raise ServeExecutionError(
+            f"ECHO_PERSONA_PLAN has {len(plan)} entries but none for "
+            f"shardIndex={shard_index} — refusing the case-persona fallback"
+        )
+    if not isinstance(entry, dict) or not entry.get("personaId"):
+        raise ServeExecutionError(
+            "ECHO_PERSONA_PLAN entry is not an object with personaId "
+            f"(shardIndex={shard_index})"
+        )
+    return entry
+
+
+def require_persona_voice_id(persona: Any, shard_index: int) -> str:
+    """Audio mode cannot start without a TTS voice — fail with a clear,
+    attributable error instead of letting the engine pick a default voice."""
+    voice_id = (getattr(persona.speech, "voiceId", "") or "").strip()
+    if not voice_id:
+        raise ServeExecutionError(
+            f"persona '{persona.id}' has an empty speech.voiceId "
+            f"(shardIndex={shard_index}) — audio mode requires a TTS voice"
+        )
+    return voice_id
 
 
 def build_session_payload(
@@ -753,6 +809,7 @@ def build_session_payload(
     brain: str | None = None,
     persona_overrides: dict[str, Any] | None = None,
     persona_source: str | None = None,
+    resolved_voice: dict[str, str] | None = None,
 ) -> dict:
     start = call.started_at_ms
 
@@ -831,6 +888,10 @@ def build_session_payload(
         payload["personaOverrides"] = persona_overrides
     if persona_source:
         payload["personaSource"] = persona_source
+    # Immutable audit snapshot of the TTS voice EFFECTIVELY synthesized on
+    # this call — later persona edits must never rewrite session history.
+    if resolved_voice:
+        payload["resolvedVoice"] = resolved_voice
     if voice_config.get("seed") is not None:
         payload["seed"] = voice_config["seed"]
     resolved_audio_status = audio_status or ("available" if audio_path else "unavailable")
@@ -1069,6 +1130,7 @@ def serve_execution(out_dir: Path) -> int:
             send_digits = "ww" + "ww".join(step.send for step in case.dial_plan.dtmf_steps)
         transport = build_transport(call_target, send_digits=send_digits)
         engine = recorder = channel_fx = None
+        resolved_voice: dict[str, str] | None = None
         receive_timeout = 10.0
         if mode == "audio":
             os.environ.setdefault("LOGURU_LEVEL", "WARNING")  # quiet pipecat logs
@@ -1076,7 +1138,18 @@ def serve_execution(out_dir: Path) -> int:
             from .audio import AudioTransportAdapter, PipecatAudioEngine, StereoCallRecorder
             from .callfx import TelephoneChannelFx, parse_ambience
 
-            engine = PipecatAudioEngine(voice_id=persona.speech.voiceId)
+            voice_id = require_persona_voice_id(persona, shard_index)
+            resolved_voice = {
+                "provider": persona.speech.ttsProvider or "elevenlabs",
+                "voiceId": voice_id,
+            }
+            # ElevenLabs voice ids are public catalog ids, not credentials —
+            # safe to log literally (scrub_sensitive still applies).
+            _safe_log(
+                f"audio voice resolved shard={shard_index} persona={persona.id} "
+                f"source={persona_source} voiceId={voice_id}"
+            )
+            engine = PipecatAudioEngine(voice_id=voice_id)
             recorder = StereoCallRecorder()
             # EXEC-REALISM: telephone channel on the persona audio — band-pass
             # 300–3400 Hz + µ-law grit + seeded ambience (ECHO_CALL_AMBIENCE,
@@ -1300,6 +1373,7 @@ def serve_execution(out_dir: Path) -> int:
                 brain="llm",
                 persona_overrides=persona_overrides_record or None,
                 persona_source=persona_source,
+                resolved_voice=resolved_voice,
             )
         )
         _safe_log(f"voice session recorded status={verdict.status}")

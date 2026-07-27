@@ -17,6 +17,7 @@ from voidr_echo_runner.service_mode import (
     persist_voice_session,
     promote_params_to_environ,
     promote_trusted_envelope_to_environ,
+    require_persona_voice_id,
     resolve_persona_plan_entry,
     serve_execution,
 )
@@ -237,7 +238,7 @@ def test_unresolved_massa_placeholder_fails_loud():
         build_case(_target(), _case_doc(), "p", _flow_with_dial_plan(), {}, massa=massa)
 
 
-# ── ECHO_PERSONA_PLAN: persona/overrides por shard (multi-persona) ───────────
+# ── persona por shard: ECHO_PERSONA_SELECTION (canônico) + PLAN (compat) ─────
 
 
 def test_persona_plan_entry_resolves_by_shard():
@@ -253,15 +254,69 @@ def test_persona_plan_entry_resolves_by_shard():
     assert resolve_persona_plan_entry(params, 2)["personaId"] == "carlos-34-paulista"
 
 
-def test_persona_plan_absent_or_short_falls_back_to_case_persona():
+def test_persona_plan_absent_or_empty_falls_back_to_case_persona():
+    # Fallback to the case persona ONLY when the execution declared nothing.
     assert resolve_persona_plan_entry({}, 1) is None
     assert resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": "[]"}, 1) is None
-    assert resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": '[{"personaId":"x"}]'}, 2) is None
+    assert resolve_persona_plan_entry({"ECHO_PERSONA_SELECTION": ""}, 1) is None
 
 
-def test_persona_plan_malformed_json_never_breaks_the_call(capsys):
-    assert resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": "{broken"}, 1) is None
-    assert "ECHO_PERSONA_PLAN inválido" in capsys.readouterr().err
+def test_persona_plan_singleton_is_the_shard_selection_regardless_of_index():
+    # Per-shard envelope compat: the service serializes [entry] per shard, so
+    # shard 2+ must use it (the old code fell back to the case persona and
+    # every shard 2+ spoke with the wrong voice).
+    params = {"ECHO_PERSONA_PLAN": '[{"personaId":"carlos-34-paulista"}]'}
+    assert resolve_persona_plan_entry(params, 1)["personaId"] == "carlos-34-paulista"
+    assert resolve_persona_plan_entry(params, 2)["personaId"] == "carlos-34-paulista"
+    assert resolve_persona_plan_entry(params, 7)["personaId"] == "carlos-34-paulista"
+
+
+def test_persona_selection_takes_precedence_over_plan():
+    params = {
+        "ECHO_PERSONA_SELECTION": '{"personaId":"carlos-34-paulista","overrides":{"verbosity":"prolixo"}}',
+        "ECHO_PERSONA_PLAN": '[{"personaId":"dona-marcia-58-mineira"}]',
+    }
+    entry = resolve_persona_plan_entry(params, 2)
+    assert entry["personaId"] == "carlos-34-paulista"
+    assert entry["overrides"] == {"verbosity": "prolixo"}
+
+
+def test_declared_persona_that_cannot_resolve_fails_closed():
+    # Selection declared but broken → explicit failure with shardIndex, never
+    # a silent fallback to the case persona (wrong voice).
+    with pytest.raises(ServeExecutionError, match="shardIndex=2"):
+        resolve_persona_plan_entry({"ECHO_PERSONA_SELECTION": "{broken"}, 2)
+    with pytest.raises(ServeExecutionError, match="personaId"):
+        resolve_persona_plan_entry({"ECHO_PERSONA_SELECTION": '{"overrides":{}}'}, 1)
+    with pytest.raises(ServeExecutionError, match="shardIndex=1"):
+        resolve_persona_plan_entry({"ECHO_PERSONA_SELECTION": '["not-an-object"]'}, 1)
+    # Legacy full plan shorter than the shard count → same fail-closed rule.
+    plan_two = '[{"personaId":"a"},{"personaId":"b"}]'
+    with pytest.raises(ServeExecutionError, match="shardIndex=3"):
+        resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": plan_two}, 3)
+    with pytest.raises(ServeExecutionError, match="shardIndex=1"):
+        resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": "{broken"}, 1)
+    with pytest.raises(ServeExecutionError, match="JSON array"):
+        resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": '{"personaId":"x"}'}, 1)
+    with pytest.raises(ServeExecutionError, match="personaId"):
+        resolve_persona_plan_entry({"ECHO_PERSONA_PLAN": '[{"overrides":{}}]'}, 1)
+
+
+def test_audio_mode_requires_non_empty_voice_id():
+    from types import SimpleNamespace
+
+    persona = SimpleNamespace(
+        id="dona-marcia-58-mineira",
+        speech=SimpleNamespace(voiceId="  ", ttsProvider="elevenlabs"),
+    )
+    with pytest.raises(ServeExecutionError) as error:
+        require_persona_voice_id(persona, 2)
+    rendered = str(error.value)
+    assert "shardIndex=2" in rendered
+    assert "dona-marcia-58-mineira" in rendered
+
+    persona.speech.voiceId = "pNInz6obpgDQGcFmaJgB"
+    assert require_persona_voice_id(persona, 2) == "pNInz6obpgDQGcFmaJgB"
 
 
 # ── serve-execution: promoção de configuração não secreta ────────────────────
@@ -418,6 +473,37 @@ def test_session_payload_records_overrides_and_source():
     )
     assert payload["personaOverrides"] == {"initialEmotion": "irritado", "patienceLevel": 1}
     assert payload["personaSource"] == "execution"
+
+
+def test_session_payload_records_resolved_voice_snapshot():
+    payload = build_session_payload(
+        "exec-1",
+        2,
+        "JORNA-01",
+        {"journeyFlowId": "flow-1", "personaId": "carlos-34-paulista"},
+        _call_result(),
+        SessionVerdict(status="passed", deviations=[]),
+        None,
+        persona_source="execution",
+        resolved_voice={"provider": "elevenlabs", "voiceId": "pNInz6obpgDQGcFmaJgB"},
+    )
+    assert payload["resolvedVoice"] == {
+        "provider": "elevenlabs",
+        "voiceId": "pNInz6obpgDQGcFmaJgB",
+    }
+
+
+def test_session_payload_omits_resolved_voice_when_absent():
+    payload = build_session_payload(
+        "exec-1",
+        1,
+        "JORNA-01",
+        {},
+        _call_result(),
+        SessionVerdict(status="passed", deviations=[]),
+        None,
+    )
+    assert "resolvedVoice" not in payload
 
 
 def test_session_payload_omits_override_fields_when_unset():
