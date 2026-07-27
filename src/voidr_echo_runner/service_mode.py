@@ -727,6 +727,8 @@ def build_session_payload(
     transcript_path: str | None,
     module_slug: str | None = None,
     audio_path: str | None = None,
+    audio_status: str | None = None,
+    audio_reason: str | None = None,
     brain: str | None = None,
     persona_overrides: dict[str, Any] | None = None,
     persona_source: str | None = None,
@@ -810,11 +812,22 @@ def build_session_payload(
         payload["personaSource"] = persona_source
     if voice_config.get("seed") is not None:
         payload["seed"] = voice_config["seed"]
-    if transcript_path or audio_path:
-        payload["artifacts"] = {
-            **({"transcriptPath": transcript_path} if transcript_path else {}),
-            **({"audioPath": audio_path} if audio_path else {}),
-        }
+    resolved_audio_status = audio_status or ("available" if audio_path else "unavailable")
+    resolved_audio_reason = (
+        None
+        if resolved_audio_status == "available"
+        else (audio_reason or "audio_not_recorded")
+    )
+    payload["artifacts"] = {
+        "audioStatus": resolved_audio_status,
+        **(
+            {"audioUnavailableReason": resolved_audio_reason}
+            if resolved_audio_reason
+            else {}
+        ),
+        **({"transcriptPath": transcript_path} if transcript_path else {}),
+        **({"audioPath": audio_path} if audio_path else {}),
+    }
     return payload
 
 
@@ -1182,6 +1195,8 @@ def serve_execution(out_dir: Path) -> int:
         shard_prefix = f"org/{org_id}/executions/{execution_id}/shards/{shard_index}"
         transcript_key: str | None = None
         audio_key: str | None = None
+        audio_status = "unavailable"
+        audio_reason = "audio_mode_disabled" if mode != "audio" else "audio_not_recorded"
         try:
             api.upload_file(
                 f"{shard_prefix}/reporter/json/test-results.json",
@@ -1198,15 +1213,30 @@ def serve_execution(out_dir: Path) -> int:
                 (run_dir / "timeline.json").read_bytes(),
                 "application/json",
             )
-            if wav_path is not None and wav_path.exists():
+            _safe_log("non-audio artifacts uploaded")
+        except Exception:  # noqa: BLE001 — report shard even if upload fails
+            _safe_log("non_audio_artifact_upload_failed; continuing", stderr=True)
+
+        # Audio has an independent outcome: JSON artifact failures must not
+        # prevent its PUT, and the path is published only after a successful PUT.
+        if wav_path is not None and wav_path.exists():
+            try:
                 audio_key = api.upload_file(
                     f"{shard_prefix}/artifacts/call.redacted.wav",
                     wav_path.read_bytes(),
                     "audio/wav",
                 )
-            _safe_log("artifacts uploaded")
-        except Exception:  # noqa: BLE001 — report shard even if upload fails
-            _safe_log("artifact_upload_failed; continuing", stderr=True)
+                audio_status = "available"
+                audio_reason = None
+                _safe_log("audio artifact uploaded")
+            except Exception:  # noqa: BLE001 — persist only a stable safe reason
+                audio_key = None
+                audio_status = "unavailable"
+                audio_reason = "audio_upload_failed"
+                _safe_log(
+                    "audio_upload_failed reason=audio_upload_failed; continuing",
+                    stderr=True,
+                )
 
         # Persist the voice session before the shard PUT that can trigger
         # execution finalization. A rejected/lost session is a shard failure,
@@ -1223,6 +1253,8 @@ def serve_execution(out_dir: Path) -> int:
                 transcript_key,
                 module_slug=case.module_slug,
                 audio_path=audio_key,
+                audio_status=audio_status,
+                audio_reason=audio_reason,
                 brain="llm",
                 persona_overrides=persona_overrides_record or None,
                 persona_source=persona_source,
