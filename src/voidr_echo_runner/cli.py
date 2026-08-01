@@ -88,11 +88,22 @@ def main(argv: list[str] | None = None) -> None:
     )
     serve.add_argument("--out", type=Path, default=Path("out"))
 
+    session_stt = sub.add_parser(
+        "serve-session-stt",
+        help="serve the governed Deepgram boundary for browser Session voice notes",
+    )
+    session_stt.add_argument("--host", default="127.0.0.1")
+    session_stt.add_argument("--port", type=int, default=3110)
+
     args = parser.parse_args(argv)
     if args.command == "serve-execution":
         from .service_mode import serve_execution
 
         sys.exit(serve_execution(args.out))
+    if args.command == "serve-session-stt":
+        from .session_stt_server import serve_session_stt
+
+        sys.exit(serve_session_stt(args.host, args.port))
     if args.command == "chat":
         from .chat import run_chat
 
