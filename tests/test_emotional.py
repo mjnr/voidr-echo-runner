@@ -265,7 +265,8 @@ def test_llm_brain_sends_structured_emotional_state(monkeypatch):
         "HIVE_GATEWAY_TOKEN": "t",
         "VOIDR_ORG_ID": "org",
         "HIVE_ECHO_PERSONA_V3_MODEL_REVISION": (
-            "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2"
+            "deepseek-v4-pro@sha256:"
+            "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
         ),
     }.items():
         monkeypatch.setenv(key, value)
@@ -291,11 +292,27 @@ def test_llm_brain_sends_structured_emotional_state(monkeypatch):
                     "provider": "litellm",
                     "modelAlias": "deepseek-v4-pro",
                     "model": "deepseek-v4-pro",
-                    "modelResolved": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
-                    "modelVersion": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
-                    "deploymentPin": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
-                    "deploymentId": "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
-                    "modelHash": "3626b4be7e3c9359631c9f400211a57aa4140c9277d334971f282c75c7521258",
+                    "modelResolved": (
+                        "deepseek-v4-pro@sha256:"
+                        "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+                    ),
+                    "modelVersion": (
+                        "deepseek-v4-pro@sha256:"
+                        "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+                    ),
+                    "deploymentPin": (
+                        "deepseek-v4-pro@sha256:"
+                        "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+                    ),
+                    "deploymentId": (
+                        "deepseek-v4-pro@sha256:"
+                        "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+                    ),
+                    "deploymentDigest": (
+                        "sha256:"
+                        "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+                    ),
+                    "modelHash": "bd00496aec074f5565909718c136fd1171e727b375b980798e0e4e00e8d67d5d",
                     "completionId": "c1",
                     "traceId": "trace-1",
                     "generatedAt": "2026-07-26T00:00:00Z",

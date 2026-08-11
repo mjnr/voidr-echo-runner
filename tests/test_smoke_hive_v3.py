@@ -19,7 +19,10 @@ sys.path.insert(0, str(ROOT / "smoke"))
 from hive_v3_stub import success_response, validate_request  # noqa: E402
 
 
-MODEL_REVISION = "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2"
+MODEL_REVISION = (
+    "deepseek-v4-pro@sha256:"
+    "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+)
 CONVERSATION_ID = "d9267c63-0f0a-5a51-9b31-33fb85bbab03"
 
 

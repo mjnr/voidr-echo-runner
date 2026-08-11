@@ -27,8 +27,11 @@ from voidr_echo_runner.service_mode import (
 
 ROOT = Path(__file__).resolve().parents[1]
 CONVERSATION_ID = "d9267c63-0f0a-5a51-9b31-33fb85bbab03"
-MODEL_REVISION = "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2"
-MODEL_HASH = "3626b4be7e3c9359631c9f400211a57aa4140c9277d334971f282c75c7521258"
+MODEL_REVISION = (
+    "deepseek-v4-pro@sha256:"
+    "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+)
+MODEL_HASH = "bd00496aec074f5565909718c136fd1171e727b375b980798e0e4e00e8d67d5d"
 
 
 @pytest.fixture
@@ -71,6 +74,7 @@ def _success(request: httpx.Request, text: str = "Quero consultar meu saldo.") -
                 "modelVersion": MODEL_REVISION,
                 "deploymentPin": MODEL_REVISION,
                 "deploymentId": MODEL_REVISION,
+                "deploymentDigest": MODEL_REVISION.rsplit("@", 1)[1],
                 "modelHash": MODEL_HASH,
                 "completionId": "completion-1",
                 "traceId": "trace-1",

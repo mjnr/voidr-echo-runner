@@ -116,7 +116,7 @@ class LLMBrain:
         if self.model_revision != self.MODEL_REVISION:
             raise RuntimeError(
                 "HIVE_ECHO_PERSONA_V3_MODEL_REVISION does not match this runner "
-                "release's immutable LiteLLM deployment UUID"
+                "release's immutable deployment digest"
             )
         # Separate calls must never share a Redis idempotency namespace merely
         # because persona/goal/seed match. Durable service executions pass an

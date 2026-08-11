@@ -252,7 +252,7 @@ Modelo, prompt e policy são fixados pelo Hive, com provenance e billing por tur
 
 ```bash
 # envs no .env: HIVE_URL, HIVE_GATEWAY_TOKEN, VOIDR_ORG_ID,
-# HIVE_ECHO_PERSONA_V3_MODEL_REVISION (@sha256:<64hex> ou @id:<uuid>, nunca alias)
+# HIVE_ECHO_PERSONA_V3_MODEL_REVISION (deepseek-v4-pro@sha256:<64hex>)
 uv run echo-runner chat --persona dona-marcia-58-mineira \
   [--journey flows/consulta-saldo-v1.json] [--voice] \
   [--seed 42] [--goal "quero saber meu saldo"]
@@ -384,7 +384,7 @@ estruturado por turno e os blocos v2 da persona vindos do service
 | `VOIDR_API_URL` | sim | Base do voidr-service (ex.: `http://localhost:3010`; `/v1` é adicionado) |
 | `EXECUTION_ID` | sim | Execution `provider: VOICE` criada no service |
 | `VOIDR_ORG_ID` | sim | Organization id (Auth0) |
-| `HIVE_ECHO_PERSONA_V3_MODEL_REVISION` | sim | Pin verificável (`@sha256:<64hex>` ou `@id:<uuid>`), igual ao Hive; aliases como `deepseek-v4-pro`, `latest` e `prod` são recusados |
+| `HIVE_ECHO_PERSONA_V3_MODEL_REVISION` | sim | Pin verificável `deepseek-v4-pro@sha256:<64hex>`, igual ao Hive; UUIDs soltos e aliases como `deepseek-v4-pro`, `latest` e `prod` são recusados |
 | `VOIDR_CLIENT_ID` / `VOIDR_CLIENT_SECRET` | sim* | Credenciais da service account |
 | `VOIDR_ACCESS_TOKEN` | não | Token pré-mintado pelo dispatch; dispensa o par client id/secret |
 | `SHARDS_CURRENT` / `SHARDS_TOTAL` | sim | Shard deste job (1-based) / total |

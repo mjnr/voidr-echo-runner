@@ -19,6 +19,9 @@ HIVE_MODE="${SMOKE_HIVE_MODE:-stub}"
 HIVE_PORT="${SMOKE_HIVE_PORT:-18765}"
 export MOCK_ACCESS_CODE="${MOCK_ACCESS_CODE:-919021552}"
 export MOCK_PORT="$PORT"
+# The offline boundary stub deliberately uses HTTP on localhost. Mark the
+# process as a test runtime so the governed-URL policy permits that transport.
+export ECHO_RUNTIME_ENV="${ECHO_RUNTIME_ENV:-test}"
 
 MOCK_PID=""
 HIVE_PID=""
@@ -57,7 +60,7 @@ configure_hive() {
       export HIVE_URL="http://127.0.0.1:$HIVE_PORT"
       export HIVE_GATEWAY_TOKEN="smoke-hive-v3-token"
       export VOIDR_ORG_ID="00000000-0000-4000-8000-000000000003"
-      export HIVE_ECHO_PERSONA_V3_MODEL_REVISION="deepseek-v4-pro@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      export HIVE_ECHO_PERSONA_V3_MODEL_REVISION="deepseek-v4-pro@sha256:59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
       ;;
     real)
       local missing=()

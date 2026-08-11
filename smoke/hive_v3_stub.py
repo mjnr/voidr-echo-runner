@@ -17,8 +17,7 @@ POLICY_VERSION = "echo-persona-turn-v3.0.0"
 PROMPT_VERSION = "echo-persona-system-v3.0.0"
 MODEL_ALIAS = "deepseek-v4-pro"
 PIN_PATTERN = re.compile(
-    r"^([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
-    r"[89ab][0-9a-f]{3}-[0-9a-f]{12})$",
+    r"^deepseek-v4-pro@(sha256:[0-9a-f]{64})$",
     re.IGNORECASE,
 )
 
@@ -115,7 +114,7 @@ def success_response(request: dict[str, Any], model_revision: str) -> dict[str, 
     match = PIN_PATTERN.fullmatch(model_revision)
     if match is None:
         raise RuntimeError(
-            "SMOKE_HIVE_MODEL_REVISION must be an immutable LiteLLM deployment UUID"
+            "SMOKE_HIVE_MODEL_REVISION must be an immutable deepseek-v4-pro digest"
         )
     request_hash = hashlib.sha256(
         json.dumps(request, sort_keys=True, separators=(",", ":")).encode()
@@ -135,7 +134,8 @@ def success_response(request: dict[str, Any], model_revision: str) -> dict[str, 
         "modelResolved": model_revision,
         "modelVersion": model_revision,
         "deploymentPin": model_revision,
-        "deploymentId": match.group(1),
+        "deploymentId": model_revision,
+        "deploymentDigest": match.group(1),
         "modelHash": model_hash,
         "completionId": f"smoke-{request_hash[:20]}",
         "traceId": f"smoke-{request_hash[20:40]}",
@@ -204,13 +204,16 @@ def main() -> None:
     token = os.environ.get("SMOKE_HIVE_TOKEN", "smoke-hive-v3-token")
     revision = os.environ.get(
         "SMOKE_HIVE_MODEL_REVISION",
-        "8b3fcb4e-61f2-4a76-9e0d-73e89bc3f1a2",
+        (
+            "deepseek-v4-pro@sha256:"
+            "59e858aa0bd9bdbc7524a5dd39d84904747dacd1f85d152d0c04bcc373db9a08"
+        ),
     )
     # Validate the pin before announcing readiness.
     if PIN_PATTERN.fullmatch(revision) is None:
         raise SystemExit(
             "SMOKE_HIVE_MODEL_REVISION must be an immutable "
-            "LiteLLM deployment UUID"
+            "deepseek-v4-pro digest"
         )
     server = ThreadingHTTPServer((host, port), HiveV3Handler)
     server.gateway_token = token  # type: ignore[attr-defined]
