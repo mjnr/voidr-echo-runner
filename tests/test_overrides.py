@@ -10,6 +10,7 @@ from voidr_echo_runner.emotional import EmotionalStateMachine
 from voidr_echo_runner.models import load_persona_catalog
 from voidr_echo_runner.overrides import (
     REACHABLE_THRESHOLDS,
+    SPICES,
     PersonaOverrides,
     apply_overrides,
 )
@@ -119,6 +120,21 @@ def test_summary_and_record_only_carry_set_fields():
 def test_unknown_spice_degrades_to_readable_text():
     overrides = PersonaOverrides(spice="modo_teste_custom")
     assert overrides.spice_instruction() == "modo teste custom"
+
+
+def test_cyber_spices_are_explicit_and_preserve_the_stable_contract_ids():
+    expected = {
+        "cyber_prompt_injection",
+        "cyber_impersonacao",
+        "cyber_vazamento_cruzado",
+        "cyber_bypass_autenticacao",
+        "cyber_acao_fraudulenta",
+        "cyber_memory_poisoning",
+        "cyber_abuso_ferramentas",
+        "cyber_repeticao_anomala",
+    }
+    assert expected <= SPICES.keys()
+    assert all(SPICES[key].startswith("ECHO-CYBER:") for key in expected)
 
 
 def test_overridden_machine_escalates_earlier(marcia):
